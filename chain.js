@@ -1,19 +1,15 @@
 /* =====================================================================
  * chain.js —— 钱包连接 + 链上查询 / 交易
  *
- * 钱包适配层（统一抽象两种接口）：
- *   1. window.paxihub   ← PaxiHub App（手机端主用，官方推荐）
- *      API: hub.paxi.getAddress() → { address, public_key }
- *           hub.paxi.signAndSendTransaction({ bodyBytes, authInfoBytes, chainId, accountNumber })
- *   2. window.keplr     ← Keplr / 桌面钱包（兼容）
- *      API: keplr.enable(chainId)
- *           keplr.signAndBroadcast(chainId, addr, msgs, fee, memo)
+ * 钱包适配层：仅支持 PaxiHub App（手机端）
+ *   window.paxihub
+ *     API: hub.paxi.getAddress() → { address, public_key }
+ *          hub.paxi.signAndSendTransaction({ bodyBytes, authInfoBytes, chainId, accountNumber })
+ *          ⚠️ signAndSendTransaction 只签名，不广播！
+ *             拿到 result.success（签名 base64）后，需自行组装 TxRaw 并 POST 到 LCD 广播。
+ *             见下方 executeViaPaxihub。
  *
- * 优先级：检测到 paxihub → 用 paxihub（sign + broadcast 一步完成）
- *         否则检测 keplr → 用 keplr
- *         两者都没有 → hasWallet() 返回 false，触发 UI 兜底
- *
- * DApp 指南参考：仓库根目录《DApp 指南.txt》§2 / §3.4
+ * 未检测到 window.paxihub → hasWallet() 返回 false，触发 UI 兜底（提示用 PaxiHub 打开）。
  * ===================================================================== */
 (function () {
   const C = window.CJ_CONFIG;
@@ -47,6 +43,18 @@
     return n.toLocaleString('zh-CN', { maximumFractionDigits: dec });
   }
 
+  /** public_key / pubkey 兼容：钱包可能返回数组（Uint8Array / Array），也可能返回 base64 字符串 */
+  function pkToHex(pk) {
+    if (pk == null) return '';
+    if (typeof pk === 'string') {
+      // base64 字符串 → decode 后转 hex
+      const bin = atob(pk);
+      return Array.from(bin).map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+    }
+    // Uint8Array / Array → 直接转
+    return Array.from(pk).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
   /** 人类可读 → raw（字符串拼接，避免浮点误差） */
   function toRaw(human, dec) {
     const s = String(human).trim();
@@ -60,42 +68,21 @@
   }
 
   // ---------- 钱包 ----------
-  const wallet = { address: '', pubkeyHex: '', kind: '' }; // kind: 'paxihub' | 'keplr' | ''
+  const wallet = { address: '', pubkeyHex: '', kind: 'paxihub' };
 
-  /** 检测钱包类型：优先 paxihub（手机端），回退 keplr（桌面/兼容） */
   function detectWalletKind() {
     if (typeof window.paxihub !== 'undefined' && window.paxihub.paxi) return 'paxihub';
-    if (typeof window.keplr !== 'undefined') return 'keplr';
     return '';
   }
 
   const hasWallet = () => detectWalletKind() !== '';
 
   async function connect() {
-    const kind = detectWalletKind();
-    if (!kind) throw new Error('未检测到 Paxi 钱包。请在 PaxiHub App 内置浏览器打开，或安装 Keplr 桌面钱包。');
-
-    if (kind === 'paxihub') {
-      // §3.2 getAddress
-      const info = await window.paxihub.paxi.getAddress();
-      wallet.address = info.address;
-      // info.public_key 是字节数组 → hex
-      wallet.pubkeyHex = Array.from(info.public_key || [])
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-      wallet.kind = 'paxihub';
-    } else {
-      // keplr 路径
-      await window.keplr.enable(C.chainId);
-      const signer = window.getOfflineSigner(C.chainId);
-      const accs = await signer.getAccounts();
-      if (!accs.length) throw new Error('钱包没有可用账户');
-      wallet.address = accs[0].address;
-      wallet.pubkeyHex = Array.from(accs[0].pubkey || [])
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-      wallet.kind = 'keplr';
-    }
+    if (!detectWalletKind()) throw new Error('未检测到 PaxiHub 钱包。请在 PaxiHub App 内置浏览器打开本页面。');
+    const info = await window.paxihub.paxi.getAddress();
+    wallet.address = info.address;
+    wallet.pubkeyHex = pkToHex(info.public_key);
+    wallet.kind = 'paxihub';
     return wallet.address;
   }
 
@@ -135,7 +122,7 @@
   function toProtoAny(typeUrl, msgValueObj) {
     return {
       typeUrl,
-      value: PaxiCosmJS.Encoder.toBase64(
+      value: toBase64(
         PaxiCosmJS.MsgExecuteContract.encode({
           sender: msgValueObj.sender,
           contract: msgValueObj.contract,
@@ -144,6 +131,21 @@
         }).finish()
       ),
     };
+  }
+
+  /** 从 tx_response.raw.logs 里提取 wasm 事件的 key/value（数组形式，供前端按 key 查找事件属性） */
+  function extractWasmAttrs(txResponse) {
+    const out = [];
+    const logs = (txResponse && txResponse.logs) || [];
+    for (const log of logs) {
+      for (const evt of (log.events || [])) {
+        if (evt.type !== 'wasm') continue;
+        for (const a of (evt.attributes || [])) {
+          out.push({ key: a.key, value: a.value });
+        }
+      }
+    }
+    return out;
   }
 
   // ---------- 交易 ----------
@@ -168,6 +170,15 @@
   /**
    * 用 paxihub 发交易（§3.4 buildAndSendTx 的精简版）。
    * 只走 wasm ExecuteContract，其余类型暂不需要。
+   *
+   * 流程：构造 SignDoc → signAndSendTransaction 让钱包签名（返回 success=base64 签名）
+   *       → 组装 TxRaw → POST 到 LCD /cosmos/tx/v1beta1/txs 广播（SYNC 模式，只等 mempool 准入）
+   *       → waitForTx 轮询链上最终执行结果 → 从 logs 提取 attributes → 返回。
+   *
+   * ⚠️ 旧注释说"signAndSendTransaction 内部完成签名+广播"是错的！
+   *    指南 §3.4 明确写了：拿到 result.success（签名 base64）后必须自己组装 TxRaw 广播。
+   *    另外 BROADCAST_MODE_SYNC 只做准入检查，合约里的 Err(TkccNotConfigured) /
+   *    Err(AlreadyJoined) / Err(Expired) 等必须靠 waitForTx 二次确认，否则会被当成成功。
    */
   async function executeViaPaxihub(execMsg, funds, opts) {
     // 先等钱包库加载完
@@ -199,7 +210,7 @@
     const feeAmount = [{ denom: C.coinMinimalDenom, amount: String(Math.max(1, Math.ceil(Number(gas) * C.gasPrice))) }];
     const fee = { amount: feeAmount, gasLimit: gas };
 
-    // PubKey Any（sender.public_key）
+    // PubKey Any
     const pubkeyBytes = new Uint8Array(wallet.pubkeyHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
     const pubkeyAny = {
       typeUrl: '/cosmos.crypto.secp256k1.PubKey',
@@ -216,7 +227,7 @@
       fee,
     });
 
-    // SignDoc（bodyBytes + authInfoBytes + chainId + accountNumber）
+    // SignDoc
     const signDoc = PaxiCosmJS.SignDoc.fromPartial({
       bodyBytes: PaxiCosmJS.TxBody.encode(txBody).finish(),
       authInfoBytes: PaxiCosmJS.AuthInfo.encode(authInfo).finish(),
@@ -224,31 +235,64 @@
       accountNumber: BigInt(accountNumber),
     });
 
-    // §3.4 signAndSendTransaction（钱包内部完成签名 + 广播）
+    // §3.4 signAndSendTransaction —— 注意：这一步只签名，不广播！
     const txObj = {
-      bodyBytes: PaxiCosmJS.Encoder.toBase64(signDoc.bodyBytes),
-      authInfoBytes: PaxiCosmJS.Encoder.toBase64(signDoc.authInfoBytes),
+      bodyBytes: toBase64(signDoc.bodyBytes),    // 本地 toBase64，不要用 PaxiCosmJS.Encoder（不存在）
+      authInfoBytes: toBase64(signDoc.authInfoBytes),
       chainId: C.chainId,
       accountNumber: String(signDoc.accountNumber),
     };
     const result = await window.paxihub.paxi.signAndSendTransaction(txObj);
 
-    // paxihub 返回值里通常有 code / transactionHash；有些版本只返回 success
-    if (result && result.transactionHash) {
-      return { code: 0, transactionHash: result.transactionHash };
+    if (!result || !result.success) {
+      throw new Error('paxihub 签名失败：' + JSON.stringify(result));
     }
-    if (result && typeof result.success !== 'undefined') {
-      // 钱包内部已广播但没直接给 txHash，等一轮确认
-      return { code: 0, transactionHash: '', raw: result };
+
+    // ---- 组装 TxRaw 并广播（指南 §3.4 后半段，旧代码完全缺失这一步）----
+    const sigBytes = Uint8Array.from(atob(result.success), (c) => c.charCodeAt(0));
+    const txRaw = PaxiCosmJS.TxRaw.fromPartial({
+      bodyBytes: signDoc.bodyBytes,
+      authInfoBytes: signDoc.authInfoBytes,
+      signatures: [sigBytes],
+    });
+    const base64Tx = toBase64(PaxiCosmJS.TxRaw.encode(txRaw).finish());
+
+    const broadcastRes = await fetchWithTimeout(`${C.lcd}/cosmos/tx/v1beta1/txs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tx_bytes: base64Tx, mode: 'BROADCAST_MODE_SYNC' }),
+    });
+    if (!broadcastRes.ok) {
+      throw new Error('广播失败：HTTP ' + broadcastRes.status);
     }
-    if (result && result.code !== undefined && result.code !== 0) {
-      throw new Error(result.rawLog || result.message || '交易失败（paxihub）');
+    let broadcast;
+    try { broadcast = await broadcastRes.json(); }
+    catch { throw new Error('LCD 返回异常（HTTP ' + broadcastRes.status + '）'); }
+    const txr = broadcast.tx_response || {};
+
+    // BROADCAST_MODE_SYNC 返回的 code 是准入检查结果（序列号错误、签名错误会在这里报）
+    if (txr.code !== undefined && txr.code !== 0) {
+      throw new Error(txr.raw_log || '广播失败：code=' + txr.code);
     }
-    return { code: 0, raw: result };
+
+    // BROADCAST_MODE_SYNC 只等 mempool 准入，不等合约执行；必须进一步用 waitForTx
+    // 轮询链上最终结果，否则合约里的 Err(TkccNotConfigured) / Err(AlreadyJoined) /
+    // Err(Expired) 会被当成成功，UI 显示"参与成功"但链上实际失败。
+    const txhash = txr.txhash;
+    if (!txhash) {
+      // 极少数情况 SYNC 不返回 txhash，只能兜底返回（合约实际执行状态未知）
+      return { code: 0, transactionHash: '', raw: txr };
+    }
+    const confirmed = await waitForTx(txhash);
+    if (!confirmed.ok) {
+      throw new Error(confirmed.log || '交易执行失败');
+    }
+    const attrs = extractWasmAttrs(confirmed.raw);
+    return { code: 0, transactionHash: txhash, raw: confirmed.raw, attributes: attrs };
   }
 
   /**
-   * 发送执行交易（统一入口，内部按钱包类型分发）。
+   * 发送执行交易。
    * @param {object} execMsg ExecuteMsg，如 { join_lottery: { id: 1, auth } }
    * @param {Array}  funds   原生币 [{ denom, amount }]
    * @param {object} opts    { gas, memo, contract, session:{action,roundId,amount} }
@@ -256,10 +300,8 @@
   async function execute(execMsg, funds = [], opts = {}) {
     if (!wallet.address) await connect();
 
-    // H4：标记本次是否用到了会话签名，用于失败时回滚 nonce
     const usedSession = opts.session && window.CJSession && window.CJSession.state.enabled;
 
-    // 无感：注入会话签名（session_addr / nonce / signature）
     let finalMsg = execMsg;
     if (usedSession) {
       const { payload } = await window.CJSession.signPayload(
@@ -271,45 +313,12 @@
       finalMsg = payload;
     }
 
-    let res;
     try {
-      if (wallet.kind === 'paxihub') {
-        res = await executeViaPaxihub(finalMsg, funds, opts);
-      } else {
-        // keplr 路径（保持原有逻辑）
-        if (!window.keplr || typeof window.keplr.signAndBroadcast !== 'function') {
-          throw new Error('当前钱包不支持 signAndBroadcast');
-        }
-        const msgs = [
-          {
-            typeUrl: '/cosmwasm.wasm.v1.MsgExecuteContract',
-            value: {
-              sender: wallet.address,
-              contract: opts.contract || C.contract,
-              msg: new TextEncoder().encode(JSON.stringify(finalMsg)),
-              funds: funds || [],
-            },
-          },
-        ];
-        const gas = String(opts.gas || C.defaultGas);
-        const fee = {
-          amount: [{ denom: C.coinMinimalDenom, amount: String(Math.max(1, Math.ceil(Number(gas) * C.gasPrice))) }],
-          gas,
-        };
-        res = await window.keplr.signAndBroadcast(C.chainId, wallet.address, msgs, fee, opts.memo || '');
-      }
+      return await executeViaPaxihub(finalMsg, funds, opts);
     } catch (e) {
-      // H4 修复：网络/钱包弹窗等异常 → 回滚本地 nonce
       if (usedSession) window.CJSession.rollbackNonce();
       throw e;
     }
-
-    // paxihub 版本可能不返回 code，但会在上面抛异常；这里兜底
-    if (res && res.code !== undefined && res.code !== 0) {
-      if (usedSession) window.CJSession.rollbackNonce();
-      throw new Error(res.rawLog || res.raw_log || res.message || '交易失败');
-    }
-    return res;
   }
 
   window.CJChain = {

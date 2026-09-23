@@ -140,9 +140,24 @@
     <div id="list" class="list"></div>
   </section>
 
+  <!-- 揭示秘密弹窗（commit-reveal 抽奖） -->
+  <div id="revealBox" hidden>
+    <div class="card">
+      <h2>揭示秘密（抽奖 #<span id="revealLotteryId"></span>）</h2>
+      <input id="revealSecret" class="inp block" type="text" placeholder="建池时填写的随机秘密" />
+      <div class="acts">
+        <button id="btnRevealConfirm" class="btn primary block">确认揭示</button>
+        <button id="btnRevealCancel" class="btn ghost block">取消</button>
+      </div>
+      <div class="hint" id="revealHint">建池时的秘密已自动带出；如果是换设备或清过缓存，请手动输入。</div>
+    </div>
+  </div>
+
   <pre id="log" class="log"></pre>
 </div>
 
+<!-- PaxiCosmJS：paxihub 模式下 build SignDoc 需要（§3.1） -->
+<script src="https://mainnet-api.paxinet.io/resources/js/paxi-cosmjs.umd.js"></script>
 <!-- 密码学库（CDN，不自己实现原语） -->
 <script src="https://cdn.jsdelivr.net/npm/@noble/secp256k1@2.1.0/index.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js"></script>

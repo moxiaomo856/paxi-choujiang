@@ -75,7 +75,7 @@ treasury: 'paxi194kpjqhyz7re2g749lc2030cgeg4sql5ldvyem', // 运营分成收款�
 
 | 区块 | 能力 |
 | --- | --- |
-| 顶部 | 连接钱包（Paxi 钱包内置浏览器）、开启 / 关闭无感 |
+| 顶部 | 连接钱包（PaxiHub App 内置浏览器）、开启 / 关闭无感 |
 | 余额 | 内部 PAXI / TKCC 余额、链上 PAXI；充值 / 提现 |
 | **官方奖池** | 展示各活跃模板的报名进度，一键参与；满员自动开新池 |
 | **管理员：运营配置** | 仅管理员可见；查看管理员白名单 / 多签阈值，写入运营金库 |
@@ -102,6 +102,29 @@ treasury: 'paxi194kpjqhyz7re2g749lc2030cgeg4sql5ldvyem', // 运营分成收款�
 > 前端签名时并不知道 pool id。金额一律以链上池子为准，前端传的 amount 只用于签名匹配。
 
 会话 24 小时过期；交易失败会自动回滚本地 nonce，并从链上重新同步。
+
+### 会话私钥存储与安全边界
+
+会话私钥存 `localStorage`，键名格式为 `cj_sess_priv__<主钱包地址>`
+（抽奖前缀 `cj_`，社交前缀 `pt_`）。**明文存储，未加密。**
+
+这是**有意**的选择：
+
+- 手机端 `sessionStorage` 在切后台 / 锁屏 / 内存紧张时会被系统清空，
+  导致"开一次无感只能用几分钟"，体验不可用；
+- `sessionStorage` 与 `localStorage` 在 XSS / 同域脚本 / 浏览器扩展这三种
+  主要攻击面前是**等价**的（都能被读），加密只能防"设备文件被物理窃取"这一种场景，
+  而那种场景下攻击者可直接打开钱包 App 转走资产，无需偷会话私钥；
+- 因此不做 AES-GCM 加密（复杂度高、保护面窄）。
+
+**缓解措施**：
+
+- 会话私钥 **≠** 主钱包私钥，泄漏只影响 `daily_limit`（默认 1e12 raw）额度内资金；
+- 可随时在链上 `RevokeSession`（前端"关闭无感"按钮会触发）；
+- 主钱包私钥从不落地。
+
+**若你的威胁模型包含"设备被物理接触且浏览器未锁定"**：请勿开启无感，
+或联系运营将 `daily_limit` 设为更小值。
 
 ## 五、TKCC 未配置时
 
@@ -131,4 +154,6 @@ CDN（index.html 内引入，无需构建）：
 * `@noble/hashes@1.4.0`（sha256 / ripemd160）
 * `bech32@2.0.0`
 
-钱包：`window.keplr`（Paxi 钱包 / Keplr 兼容注入）。
+钱包：**仅支持** `window.paxihub`（PaxiHub App 内置浏览器）。
+      PaxiHub 的 signAndSendTransaction 只签名，客户端自行组装 TxRaw
+      并 POST 到 LCD（BROADCAST_MODE_SYNC）广播，然后 waitForTx 轮询最终结果。

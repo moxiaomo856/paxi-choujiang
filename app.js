@@ -22,6 +22,45 @@
   const escapeHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+  // ---------- 通用复制（手机端刚需：长按选择长文本体验差）----------
+  async function copyText(text, label) {
+    const s = String(text == null ? '' : text);
+    if (!s) return;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(s);
+      } else {
+        // 手机 WebView / 非 https 兜底
+        const ta = document.createElement('textarea');
+        ta.value = s;
+        ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      log('已复制' + (label ? ' ' + label : '') + '：' + s.slice(0, 16) + (s.length > 16 ? '…' : ''));
+    } catch (e) {
+      banner('复制失败，请长按手动选择', 'warn');
+    }
+  }
+  // 生成可复制的 HTML 片段（渲染时套用即可）
+  function copyable(text, label, display) {
+    const t = String(text == null ? '' : text);
+    const d = display == null ? t : String(display);
+    return `<span class="copyable" title="点击复制 ${escapeHtml(label || '')}" `
+      + `data-copy="${escapeHtml(t)}" data-copy-label="${escapeHtml(label || '')}">`
+      + `${escapeHtml(d)}</span>`;
+  }
+  // 全局事件委托：任何 [data-copy] 元素被点击都触发复制
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest && e.target.closest('[data-copy]');
+    if (!el) return;
+    e.preventDefault();
+    copyText(el.dataset.copy, el.dataset.copyLabel || '');
+  });
+
   let tkccInfo = { token: '', decimals: C.tkccDecimals, configured: false };
   let view = [];
   let isAdmin = false;
@@ -33,7 +72,7 @@
   // ---------- 钱包 / 会话 ----------
   async function onConnect() {
     const addr = await K.connect();
-    $('addr').textContent = addr.slice(0, 10) + '…' + addr.slice(-6);
+    $('addr').innerHTML = copyable(addr, '地址', addr.slice(0, 10) + '…' + addr.slice(-6));
     $('btnSession').hidden = false;
     // 依赖 CDN 的加密库自检：连上就先确认，避免"提交时才失败、分不清是 CDN 还是合约"
     if (!(window.CJHash && window.CJHash.ready())) {
@@ -123,6 +162,7 @@
     $('sessTag').hidden = false;
     $('btnSession').textContent = '关闭无感';
     log('无感已开启：' + a);
+    banner(`无感已开启（${C.sessionTtlHours || 24} 小时）。期间切后台 / 锁屏不会失效；如需撤销请点"关闭无感"。`, 'info');
   }
 
   // ---------- 数据 ----------
@@ -258,8 +298,11 @@
         ? '<div class="hint" style="color:var(--warn)">⚠️ 创建者未揭示秘密，暂不能开奖；到期后可退款</div>'
         : '';
 
+      const fmtWin = (list) => (list || [])
+        .map((a) => copyable(a, '地址', a.slice(0, 8) + '…' + a.slice(-4)))
+        .join('、');
       const win = v.winners
-        ? `<div class="win">一等奖：${(v.winners.first || []).join(', ')}<br/>二等奖：${(v.winners.second || []).join(', ')}</div>`
+        ? `<div class="win">一等奖：${fmtWin(v.winners.first)}<br/>二等奖：${fmtWin(v.winners.second)}</div>`
         : '';
 
       const poolTag = v.isTemplatePool
@@ -268,7 +311,7 @@
 
       return `<div class="item">
         <div class="item-top">
-          <span class="id">#${v.id}</span>
+          <span class="id">${copyable(String(v.id), '抽奖 ID', '#' + v.id)}</span>
           <span class="st ${v.status}">${v.statusText}</span>
           ${poolTag}
           ${isCreator ? '<span class="st mine">我建的</span>' : ''}
@@ -334,7 +377,6 @@
     } catch (e) {
       log('参与失败：' + (e.message || e));
       banner(e.message || String(e), 'err');
-      S.rollbackNonce();
     }
   }
 
@@ -387,7 +429,7 @@
       if (act === 'join') {
         const v = view.find((x) => x.id === id);
         const res = await L.joinLottery(id, v.joinTkccRaw, v.joinPaxiRaw);
-        log(`参与 #${id} 成功 tx=${res.transactionHash || res.hash || ''}`);
+        log(`参与 #${id} 成功${res.transactionHash || res.hash ? ' tx=' + (res.transactionHash || res.hash) : ''}`);
         await S.syncNonce();
       } else if (act === 'draw') {
         const res = await L.drawLottery(id);
@@ -399,16 +441,22 @@
         await L.refund(id);
         log(`退款 #${id} 成功`);
       } else if (act === 'reveal') {
-        const secret = prompt('请输入建池时填写的随机秘密：');
-        if (!secret) return;
-        await L.revealSecret(id, secret);
-        log(`揭示 #${id} 成功`);
+        // 不再用 window.prompt（手机 WebView 常拦截 prompt），改页面内弹窗
+        const saved = localStorage.getItem('cj_secret_' + id);
+        $('revealLotteryId').textContent = id;
+        $('revealSecret').value = saved || '';
+        $('revealBox').hidden = false;
+        $('revealHint').textContent = saved
+          ? '秘密已自动带出；确认揭示或修改后点"确认揭示"。'
+          : '未找到自动保存的秘密，请手动输入建池时填写的随机秘密。';
+        // 预聚焦输入框让用户能立即改值
+        setTimeout(() => $('revealSecret').focus({ preventScroll: true }), 50);
+        return;  // 等用户点确认按钮
       }
       await refreshAll();
     } catch (e) {
       log('失败：' + (e.message || e));
       banner(e.message || String(e), 'err');
-      if (act === 'join') S.rollbackNonce();
     }
   }
 
@@ -427,14 +475,21 @@
         maxPeople: $('fMax').value,
         commitHash,
       });
-      log('创建成功 ' + (res.transactionHash || ''));
-      if (secret) localStorage.setItem('cj_secret_' + Date.now(), secret);
+      log('创建成功' + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
+      // lottery_id 在 res.attributes 里（由 extractWasmAttrs 从事件提取），
+      // 兜底从 res.raw.logs 里找
+      let id = res.attributes?.find((a) => a.key === 'lottery_id')?.value
+        || res.raw?.logs?.[0]?.events
+           ?.find((e) => e.type === 'wasm')
+           ?.attributes?.find((a) => a.key === 'lottery_id')?.value;
+      // #3：把 secret 存 localStorage，key = 'cj_secret_<lottery_id>'，
+      // 这样 reveal 时才能按 id 正确带出（之前用 Date.now() 当 key 对不上）
+      if (secret && id) localStorage.setItem('cj_secret_' + id, secret);
       await S.syncNonce();
       await refreshAll();
     } catch (e) {
       log('创建失败：' + (e.message || e));
       banner(e.message || String(e), 'err');
-      S.rollbackNonce();
     }
   }
 
@@ -496,6 +551,24 @@
   $('btnRefresh').onclick = () => refreshAll().catch((e) => banner(e.message, 'err'));
   $('fStatus').onchange = () => refreshList().catch((e) => banner(e.message, 'err'));
 
+  // reveal 弹窗按钮（commit-reveal 抽奖）
+  $('btnRevealCancel').onclick = () => { $('revealBox').hidden = true; };
+  $('btnRevealConfirm').onclick = async () => {
+    const secret = $('revealSecret').value.trim();
+    if (!secret) { banner('请填写随机秘密', 'warn'); return; }
+    try {
+      const nid = Number($('revealLotteryId').textContent);
+      await L.revealSecret(nid, secret);
+      log('揭示 #' + nid + ' 成功');
+      localStorage.removeItem('cj_secret_' + nid);
+      $('revealBox').hidden = true;
+      await refreshAll();
+    } catch (e) {
+      log('揭示失败：' + (e.message || e));
+      banner(e.message || String(e), 'err');
+    }
+  };
+
   // 自动填充业务默认值
   $('fJoinPaxi').value = C.joinPaxiMin;
   $('fJoinTkcc').value = C.joinTkccMin;
@@ -506,6 +579,36 @@
   // 未连接钱包也先把 TKCC 地址 / 精度显示出来（只读查询，不需要钱包）
   refreshTkcc(true).catch(() => {});
 
-  if (K.hasWallet()) onConnect().catch(() => {});
-  else banner('未检测到 Paxi 钱包，请在钱包 App 内置浏览器打开', 'warn');
+  // #6：轮询 + 切回可见自动刷新（配置里 pollInterval 已声明）
+  if (C.pollInterval > 0) {
+    setInterval(() => {
+      if (document.visibilityState === 'visible' && K.wallet.address) {
+        refreshAll().catch(() => {});
+      }
+    }, C.pollInterval);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && K.wallet.address) {
+      refreshAll().catch(() => {});
+    }
+  });
+
+  if (K.hasWallet()) {
+    onConnect().catch(() => {});
+  } else if (/Mobi/i.test(navigator.userAgent)) {
+    // #2：手机端无钱包时，提示用户用 PaxiHub 打开；不自动跳转（尊重用户）
+    banner('未检测到 PaxiHub 钱包。点这里在 PaxiHub App 中打开 →', 'warn');
+    const b = document.getElementById('banner');
+    if (b) {
+      b.style.cursor = 'pointer';
+      b.onclick = () => {
+        window.location.href = `paxi://hub/explorer?url=${encodeURIComponent(window.location.href)}`;
+        setTimeout(() => {
+          window.location.href = 'https://paxinet.io/paxi_docs/paxihub#paxihub-application';
+        }, 1500);
+      };
+    }
+  } else {
+    banner('未检测到 PaxiHub 钱包。请在 PaxiHub App 内置浏览器打开本页面。', 'warn');
+  }
 })();
