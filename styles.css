@@ -1,0 +1,144 @@
+:root {
+  color-scheme: dark;   /* 让原生控件（select 下拉、日期等）也走暗色渲染 */
+  --bg: #0f1115;
+  --card: #171a21;
+  --line: #262b36;
+  --txt: #e6e9ef;
+  --muted: #8b94a7;
+  --pri: #ff6b35;
+  --pri2: #ff8f5e;
+  --ok: #2ecc71;
+  --warn: #f5a623;
+  --err: #ff4d4f;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--txt);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.app { max-width: 720px; margin: 0 auto; padding: 12px 12px 40px; }
+
+.top { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0 12px; }
+.brand { font-size: 18px; font-weight: 700; }
+.wallet { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.addr { color: var(--muted); font-size: 12px; }
+.tag { background: rgba(46,204,113,.15); color: var(--ok); padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+
+.btn {
+  background: #222733; color: var(--txt); border: 1px solid var(--line);
+  padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 13px;
+}
+.btn:hover { border-color: #3a4152; }
+.btn.primary { background: var(--pri); border-color: var(--pri); color: #fff; }
+.btn.primary:hover { background: var(--pri2); }
+.btn.ghost { background: transparent; }
+.btn.block { width: 100%; margin-top: 10px; padding: 10px; }
+.btn.sm { padding: 5px 10px; font-size: 12px; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.inp {
+  background: #10131a; border: 1px solid var(--line); color: var(--txt);
+  padding: 7px 10px; border-radius: 8px; font-size: 13px; min-width: 90px;
+}
+select.inp { min-width: 100px; }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.card h2 { margin: 0 0 8px; font-size: 15px; }
+.hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+
+.banner { padding: 10px 12px; border-radius: 10px; margin-bottom: 12px; font-size: 13px; }
+.banner.info { background: rgba(255,107,53,.12); color: var(--pri2); }
+.banner.warn { background: rgba(245,166,35,.12); color: var(--warn); }
+.banner.err { background: rgba(255,77,79,.12); color: var(--err); }
+
+.row { display: flex; gap: 10px; align-items: center; }
+.row.wrap { flex-wrap: wrap; margin-top: 10px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.grid2 label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.grid2 .inp { width: 100%; }
+
+.bal { display: flex; flex-direction: column; gap: 2px; }
+.bal .k { font-size: 12px; color: var(--muted); }
+.bal .v { font-size: 16px; font-weight: 600; }
+
+.list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.item { border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: #12151c; }
+.item-top { display: flex; align-items: center; gap: 8px; }
+.item-top .id { font-weight: 700; }
+.st { font-size: 11px; padding: 2px 8px; border-radius: 8px; background: #222733; color: var(--muted); }
+.st.open { background: rgba(255,107,53,.15); color: var(--pri2); }
+.st.full { background: rgba(245,166,35,.15); color: var(--warn); }
+.st.drawn { background: rgba(46,204,113,.15); color: var(--ok); }
+.st.mine { background: rgba(120,140,255,.15); color: #9aa8ff; }
+.st.platform { background: rgba(255,107,53,.15); color: var(--pri2); }
+.st.player { background: rgba(120,140,255,.15); color: #9aa8ff; }
+.st.refunded { background: rgba(120,140,255,.15); color: #9aa8ff; }
+.meta { color: var(--muted); font-size: 12px; margin-top: 4px; word-break: break-all; }
+.bar { height: 6px; background: #222733; border-radius: 4px; margin: 8px 0; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--pri); }
+.acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.win { margin-top: 6px; font-size: 12px; color: var(--ok); word-break: break-all; }
+
+.log {
+  background: #10131a; border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px; color: var(--muted); font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap;
+}
+
+/* ======================================================================
+ * 移动端适配（游戏主要在手机上玩，桌面只是顺带）
+ * 原则：
+ *  1) 触控目标 >= 44px（Apple HIG / Material 的最小可点面积）
+ *  2) 输入框字号 16px —— 小于 16px 时 iOS 聚焦会强制放大整页
+ *  3) 不出现横向滚动；长地址 / 长文本一律换行
+ * ====================================================================== */
+
+/* —— 触屏基础（所有尺寸生效，桌面上无副作用）—— */
+html { -webkit-text-size-adjust: 100%; }
+body { overflow-x: clip; -webkit-tap-highlight-color: transparent; }
+.btn, .tab, .chip, select {
+  touch-action: manipulation;                       /* 去掉双击缩放的 300ms 延迟 */
+  -webkit-user-select: none; user-select: none;
+}
+.inp, .area, textarea {
+  touch-action: manipulation;
+  -webkit-user-select: text; user-select: text;     /* 输入框必须能选中 / 复制 */
+}
+/* 刘海屏 / 手势条：底部留出安全区（index.html 已开 viewport-fit=cover） */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .app { padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
+}
+
+@media (max-width: 520px) {
+  body { font-size: 15px; }
+  /* 顶部也留安全区：普通浏览里 inset-top=0 无感；PWA/全屏模式下防刘海遮挡 */
+  .app { padding: calc(10px + env(safe-area-inset-top)) 10px calc(24px + env(safe-area-inset-bottom)); }
+  .card { padding: 12px; }
+
+  /* 顶栏：品牌与钱包分两行，避免在 360px 宽度里挤成一团 */
+  .top { flex-direction: column; align-items: stretch; gap: 10px; padding-top: 10px; }
+  .wallet { justify-content: flex-start; row-gap: 8px; }
+  .wallet .btn.primary { flex: 1 1 100%; }          /* 「连接钱包」独占一行，最好点 */
+  .wallet .addr { flex: 1 1 auto; }
+
+  /* 触控目标 */
+  .btn { min-height: 44px; padding: 11px 14px; font-size: 15px; }
+  .btn.sm { min-height: 44px; padding: 10px 12px; font-size: 14px; }
+  .btn.block { padding: 13px; font-size: 16px; }
+
+  /* 输入框：16px 防 iOS 自动放大；min-width 归零才能正确参与换行 */
+  .inp { font-size: 16px; min-height: 44px; padding: 10px 12px; min-width: 0; }
+  .row.wrap .inp { flex: 1 1 130px; }
+  .grid2 { grid-template-columns: 1fr; }
+  .grid2 label { font-size: 13px; }
+
+  /* 列表项：状态标签可换行；操作按钮铺满整行，单手好点 */
+  .item { padding: 12px; }
+  .item-top { flex-wrap: wrap; }
+  .acts { gap: 8px; }
+  .acts .btn { flex: 1 1 auto; }
+
+  .bal .v { font-size: 17px; }
+  .log { max-height: 160px; }
+}

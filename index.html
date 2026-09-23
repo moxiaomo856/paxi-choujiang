@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<!-- 手机浏览器工具栏染色（与 --bg 一致），视觉上更像原生应用 -->
+<meta name="theme-color" content="#0f1115" />
+<title>Paxi 抽奖</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">🎰 Paxi 抽奖</div>
+    <div class="wallet">
+      <span id="addr" class="addr">未连接</span>
+      <button id="btnConnect" class="btn primary">连接钱包</button>
+      <button id="btnSession" class="btn" hidden>开启无感</button>
+      <span id="sessTag" class="tag" hidden>无感已开启</span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <!-- 余额 -->
+  <section class="card">
+    <h2>我的内部余额</h2>
+    <div class="row">
+      <div class="bal"><span class="k">PAXI</span><span id="balPaxi" class="v">0</span></div>
+      <div class="bal"><span class="k" id="balTkccLabel">TKCC</span><span id="balTkcc" class="v">0</span></div>
+      <div class="bal"><span class="k">链上 PAXI</span><span id="bankPaxi" class="v">0</span></div>
+    </div>
+    <div class="row wrap">
+      <input id="depAmount" class="inp" type="number" min="0" step="0.000001" placeholder="数量" />
+      <select id="depToken" class="inp">
+        <option value="paxi">PAXI</option>
+        <option value="tkcc">TKCC</option>
+      </select>
+      <button id="btnDeposit" class="btn">充值</button>
+      <button id="btnWithdraw" class="btn ghost">提现</button>
+    </div>
+    <p class="hint">高频操作走内部余额 + 会话签名，无需逐笔弹钱包。TKCC 未配置时无法充值 TKCC。</p>
+  </section>
+
+  <!-- 官方模板池（B2） -->
+  <section class="card" id="templateSection">
+    <h2>官方奖池</h2>
+    <p class="hint">点击参与，金额由平台统一设定，满员自动开奖。先到先参与，人人平等（第一个参与的人与后来者待遇完全一致）。</p>
+    <div id="templatePools" class="list"></div>
+  </section>
+
+  <!-- 管理员：模板管理（B2） -->
+  <section class="card" id="adminPanel" hidden>
+    <h2>管理员：运营配置</h2>
+    <p class="hint" id="adminsStatus">管理员：—</p>
+    <p class="hint" id="treasuryStatus">运营金库：—</p>
+    <div class="row wrap">
+      <button id="btnSetTreasury" class="btn">写入运营金库</button>
+    </div>
+
+    <h2>管理员：TKCC 集成</h2>
+    <p class="hint" id="tkccStatus">TKCC 合约：—</p>
+    <div class="row wrap">
+      <button id="btnSetTkcc" class="btn primary">启用 TKCC（写入合约）</button>
+    </div>
+    <div class="grid2">
+      <label>销毁方式（开奖 6%）
+        <select id="burnMode" class="inp">
+          <option value="burn">Burn —— 调用 TKCC 的 burn（真销毁，推荐）</option>
+          <option value="black_hole">BlackHole —— 转到黑洞地址</option>
+          <option value="skip">Skip —— 转入金库（仅测试网）</option>
+        </select>
+      </label>
+      <label>黑洞地址（仅 BlackHole 需要）
+        <input id="burnAddr" class="inp" placeholder="paxi1…" />
+      </label>
+    </div>
+    <div class="row wrap">
+      <button id="btnSetBurnMode" class="btn">应用销毁方式</button>
+      <button id="btnSetBurn" class="btn ghost">设置黑洞地址</button>
+    </div>
+    <p class="hint">
+      地址取自 <code>config.js</code>，点一次即写入合约，之后自动生效（无需迁移）。
+      TKCC 与 PAXI 精度都是 <b>6</b>（1 TKCC = 10<sup>6</sup> raw）；本 TKCC 是标准
+      <code>cw20-base</code>，支持 <code>burn</code>，可用真销毁。
+    </p>
+
+    <h2>管理员：模板管理</h2>
+    <div class="grid2">
+      <label>模板名<input id="tplName" class="inp" placeholder="入门池" /></label>
+      <label>参与费 PAXI（1–10）<input id="tplJoinPaxi" class="inp" type="number" min="1" max="10" value="1" /></label>
+      <label>参与费 TKCC（1万–10万）<input id="tplJoinTkcc" class="inp" type="number" min="10000" max="100000" value="10000" /></label>
+      <label>人数下限（5–50）<input id="tplMin" class="inp" type="number" value="5" min="5" max="50" /></label>
+      <label>人数上限（5–50）<input id="tplMax" class="inp" type="number" value="50" min="5" max="50" /></label>
+    </div>
+    <button id="btnCreateTpl" class="btn primary block">创建模板</button>
+    <div id="tplList" class="list"></div>
+  </section>
+
+  <!-- 创建抽奖（A 模式：玩家自建池） -->
+  <section class="card">
+    <h2>创建抽奖（玩家自建池）</h2>
+    <p class="hint">建池需支付 <b>50 PAXI + 60 万 TKCC</b>，全额进入奖池。所有加入者按你设定的参与费支付，金额完全一致。</p>
+    <div class="grid2">
+      <label>参与费 PAXI（1–10）
+        <input id="fJoinPaxi" class="inp" type="number" value="1" min="1" max="10" step="1" />
+      </label>
+      <label>参与费 TKCC（1万–10万）
+        <input id="fJoinTkcc" class="inp" type="number" value="10000" min="10000" max="100000" step="1000" />
+      </label>
+      <label>人数下限（5–50）
+        <input id="fMin" class="inp" type="number" value="5" min="5" max="50" step="1" />
+      </label>
+      <label>人数上限（5–50）
+        <input id="fMax" class="inp" type="number" value="50" min="5" max="50" step="1" />
+      </label>
+      <label>时长（小时）
+        <input id="fHours" class="inp" type="number" value="24" min="1" max="168" step="1" />
+      </label>
+      <label>随机秘密（可选，commit-reveal）
+        <input id="fSecret" class="inp" type="text" placeholder="留空则用兜底随机源" />
+      </label>
+    </div>
+    <button id="btnCreate" class="btn primary block">创建</button>
+  </section>
+
+  <!-- 列表 -->
+  <section class="card">
+    <h2>抽奖列表</h2>
+    <div class="row wrap">
+      <select id="fStatus" class="inp">
+        <option value="">全部</option>
+        <option value="open">报名中</option>
+        <option value="full">已满员</option>
+        <option value="drawn">已开奖</option>
+        <option value="refunded">已退款</option>
+      </select>
+      <button id="btnRefresh" class="btn">刷新</button>
+    </div>
+    <div id="list" class="list"></div>
+  </section>
+
+  <pre id="log" class="log"></pre>
+</div>
+
+<!-- 密码学库（CDN，不自己实现原语） -->
+<script src="https://cdn.jsdelivr.net/npm/@noble/secp256k1@2.1.0/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/ripemd160.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bech32@2.0.0/dist/index.min.js"></script>
+
+<script src="hash.js"></script>
+<script src="config.js"></script>
+<script src="chain.js"></script>
+<script src="session.js"></script>
+<script src="lottery.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

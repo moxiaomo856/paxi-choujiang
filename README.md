@@ -1,0 +1,134 @@
+# 🎰 choujiang —— 抽奖前端
+
+纯静态站点，可直接推到 GitHub Pages。对应合约：`contracts/paxi-lottery-contract`。
+
+## 双模式说明
+
+### 官方奖池（推荐）
+管理员预设模板，用户点击"参与"即可，金额由平台统一设定。
+池子满员自动开奖，同时自动用同模板开下一个池子。
+**第一个参与的人与后面的人待遇完全一致，没有任何特殊奖励。**
+
+### 玩家自建池（高级）
+任何玩家支付 **50 PAXI + 60 万 TKCC** 建池，可自定义参与费和人数。
+建池者分得 **14% TKCC / 15% PAXI** 作为组织激励。
+
+## 一、文件
+
+```
+index.html    页面结构
+config.js     链参数 / 合约地址 / 业务默认值
+hash.js       加密工具（secp256k1 / sha256 / ripemd160 / bech32，走 CDN 库）
+chain.js      钱包连接 + 合约查询 / 交易
+session.js    无感会话密钥（domain = "lottery"）
+lottery.js    抽奖合约调用封装
+app.js        UI 逻辑
+styles.css    样式
+```
+
+## 二、部署前必做
+
+1. 打开 `config.js`，把 `contract` 改成部署后的抽奖合约地址：
+
+```js
+contract: 'paxi1...（paxi-lottery-contract 地址）',
+```
+
+2. **TKCC 地址已内置**，无需改动：
+
+```js
+tkccToken: 'paxi1s353hkvev2xtv5076wr5l2v6wy4tl9ph872g0puupakcx2p6rkls8q3vms',
+```
+
+这是主网 TKCC（`TK Card Coin` / decimals 6 / `cw20-base`）。
+运行时优先用合约 `{"tkcc":{}}` 的返回值；合约尚未 `SetTkccToken` 时用这一条兜底，
+并**直接向 TKCC 合约查 `token_info`** 拿 symbol 与 decimals（所以余额、精度在管理员启用前就能正确显示）。
+
+3. **管理员 / 运营金库已内置**（写入合约时用；前端据此判断管理员）：
+
+```js
+admins: [
+  'paxi1rdarmm997hqwfdgl9wvnpffe28zmex3kfyg7xd',
+  'paxi1qvrmsftn402cumn0axqjc4dgvmkge6lhp0y39j',
+],
+multisigThreshold: 1,
+treasury: 'paxi194kpjqhyz7re2g749lc2030cgeg4sql5ldvyem', // 运营分成收款地址
+```
+
+> 前端判断管理员时**优先用链上 `{"admins":{}}`**；合约还没部署/查询失败时回落到这份白名单，
+> 所以本地联调也能看到管理面板。
+
+4. **管理员启用**（一次性，页面按钮即可）：
+
+* 「管理员：运营配置」→ 点 **写入运营金库**，把 `treasury` 写进合约；
+* 「管理员：TKCC 集成」→ 点 **启用 TKCC（写入合约）**，写入 TKCC 地址；
+* 6% 销毁建议选 **`burn`**（该 TKCC 是标准 cw20-base，支持 `burn`，真减少总供应）；
+  不想真销毁就选 `black_hole` 并填黑洞地址；
+* 习惯用 CLI：`SOCIAL_ADDR=… LOTTERY_ADDR=… ./scripts/set-tkcc.sh`（含运营金库）。
+
+5. 推到 GitHub，Settings → Pages → 选分支根目录（或 `/choujiang`），用 **HTTPS** 访问
+   （钱包注入只在 https 生效）。
+
+> **精度**：PAXI 与 TKCC 都是 **6**（1 个 = `10^6` raw）。10000 TKCC = `10000000000` raw。
+
+## 三、页面功能
+
+| 区块 | 能力 |
+| --- | --- |
+| 顶部 | 连接钱包（Paxi 钱包内置浏览器）、开启 / 关闭无感 |
+| 余额 | 内部 PAXI / TKCC 余额、链上 PAXI；充值 / 提现 |
+| **官方奖池** | 展示各活跃模板的报名进度，一键参与；满员自动开新池 |
+| **管理员：运营配置** | 仅管理员可见；查看管理员白名单 / 多签阈值，写入运营金库 |
+| **管理员：TKCC 集成** | 仅管理员可见；一键写入 TKCC 地址、设置销毁方式 / 黑洞地址 |
+| **管理员：模板管理** | 仅管理员可见；创建 / 启停模板，查看模板列表 |
+| 创建抽奖 | 玩家自建池：参与费 PAXI（1–10）、参与费 TKCC（1万–10万）、人数 5–50、时长、随机秘密 |
+| 列表 | 按状态筛选；参与 / 开奖 / 领取 / 退款 / 揭示秘密；每条带"官方池 / 玩家建池"标签 |
+
+## 四、无感签名
+
+开启"无感"时会弹**一次**钱包注册会话，之后参与 / 建池由会话密钥本地签名：
+
+```
+{chainId}:{contractAddr}:lottery:{action}:{roundId}:{amount}:{nonce}:{pubkeyHex}
+```
+
+| 操作 | action | roundId | amount |
+| --- | --- | --- | --- |
+| 建池（A 模式） | `create_lottery` | `0` | 建池 TKCC 费（raw） |
+| 参与玩家池（A 模式） | `join_lottery` | 抽奖 ID | 参与 TKCC 费（raw） |
+| 激活模板（B2 模式） | `activate_template` | 模板 ID | 参与 TKCC 费（raw） |
+
+> B2 模式的 `roundId` 用 **template_id**（不是 pool_id）：池子可能在本笔交易里才被创建，
+> 前端签名时并不知道 pool id。金额一律以链上池子为准，前端传的 amount 只用于签名匹配。
+
+会话 24 小时过期；交易失败会自动回滚本地 nonce，并从链上重新同步。
+
+## 五、TKCC 未配置时
+
+* 页面顶部黄条提示"TKCC 尚未配置"
+* 创建 / 参与抽奖会失败并返回 `TkccNotConfigured`
+* 管理员在「管理员：TKCC 集成」点一次 **启用 TKCC**（或两个合约各调一次 `SetTkccToken`），刷新即可恢复正常
+
+## 六、费用速查
+
+| 项 | A 玩家建池 | B2 模板池 |
+| --- | --- | --- |
+| 建池费 | 50 PAXI + 60 万 TKCC | 0 |
+| 参与费 | 建池者定（1–10 PAXI + 1万–10万 TKCC） | 管理员预设 |
+| 人数 | 5–50 | 5–50 |
+| 触发者奖励 | — | **无**（与普通参与者完全一致） |
+| 一等奖 | 1 人，TKCC 38% / PAXI 40% | 同左 |
+| 二等奖 | 2 人，TKCC 共 28% / PAXI 共 30% | 同左 |
+| 建池者 | TKCC 14% / PAXI 15% | 0 |
+| 运营 | TKCC 14% / PAXI 15% | **28% / 30%**（含建池者那份） |
+| 销毁 | TKCC 6% | TKCC 6% |
+
+## 七、依赖
+
+CDN（index.html 内引入，无需构建）：
+
+* `@noble/secp256k1@2.1.0`
+* `@noble/hashes@1.4.0`（sha256 / ripemd160）
+* `bech32@2.0.0`
+
+钱包：`window.keplr`（Paxi 钱包 / Keplr 兼容注入）。
