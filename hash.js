@@ -59,18 +59,20 @@
   }
 
   /**
-   * 裸 SHA-256 后签名，返回 64 字节 hex（r‖s）。
+   * 对任意字节的 SHA-256 摘要做 secp256k1 签名，返回 64 字节 compact hex（r‖s）。
    *
-   * 必须是 **async**，原因有两个：
-   * 1. @noble/secp256k1@2 的**同步** sign 需要预置 `etc.hmacSha256Sync`，
-   *    否则抛 "etc.hmacSha256Sync not set"；只有 signAsync 开箱可用。
-   * 2. v2 返回的 Signature 对象 r/s 是 **bigint**，
-   *    `Uint8Array.set(bigint, 0)` 会直接 TypeError，必须先转 32 字节 hex。
+   * 两个用途：
+   * 1) signHash —— 会话授权原文（字符串 → UTF-8 字节）；
+   * 2) **真无感交易** —— Cosmos SignDoc 签名 = Sign(SHA256(SignDoc 编码字节))，
+   *    与 SDK secp256k1 验签一致（64 字节 compact，noble 默认 low-S）。
+   *
+   * 必须用 **signAsync**：@noble/secp256k1@2 的同步 sign 需要预置
+   * etc.hmacSha256Sync，否则抛 "etc.hmacSha256Sync not set"。
    */
-  async function signHash(message, privHex) {
+  async function signBytes(bytes, privHex) {
     await waitForLibs();
     const { pk, hs } = requireLib();
-    const sha = hs.sha256(new TextEncoder().encode(message));
+    const sha = hs.sha256(bytes);
     let sig;
     if (typeof pk.signAsync === 'function') {
       sig = await pk.signAsync(sha, bytesOf(privHex));
@@ -90,6 +92,10 @@
       throw new Error('签名结果格式未知');
     }
     return hexOf(sigBytes);
+  }
+
+  async function signHash(message, privHex) {
+    return signBytes(new TextEncoder().encode(message), privHex);
   }
 
   function sha256Hex(str) {
@@ -120,5 +126,5 @@
     }
   }
 
-  window.CJHash = { pubkeyToAddr, genKeyPair, signHash, sha256Hex, ready, hexOf, bytesOf };
+  window.CJHash = { pubkeyToAddr, genKeyPair, signHash, signBytes, sha256Hex, ready, hexOf, bytesOf };
 })();

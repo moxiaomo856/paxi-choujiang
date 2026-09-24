@@ -202,7 +202,7 @@
     $('sessTag').hidden = false;
     $('btnSession').textContent = '关闭无感';
     log('无感已开启：' + a);
-    banner(`无感已开启（${C.sessionTtlHours || 24} 小时）。期间切后台 / 锁屏不会失效；如需撤销请点"关闭无感"。`, 'info');
+    banner(`无感已开启。已随注册给会话账户预存 ${(Number(C.sessionGasFund || 300000) / 1e6).toFixed(2)} PAXI gas：之后「参与 / 建池」由会话私钥本地签名广播，不再弹钱包；充值 / 提现 / 领奖仍需钱包确认。gas 耗尽后参与会自动改走钱包签名，重新开启无感即可再充。`, 'info');
   }
 
   // ---------- 数据 ----------
@@ -445,20 +445,24 @@
       // 查询失败才回落本地表（与旧逻辑一致）。
       const res = await L.activePoolOfTemplates().catch(() => ({ entries: [] }));
       const entry = (res.entries || []).find((x) => x.template_id === Number(tid));
-      let joinTkccCount, joinPaxiHuman;
+      let joinTkccRaw, joinPaxiRaw;
       if (entry) {
-        joinTkccCount = entry.join_tkcc;
-        joinPaxiHuman = entry.join_paxi;
+        // ⚠️ 单位（上一轮的回归 bug，务必看清）：
+        // * entry.join_paxi 是 **upaxi raw**（合约 TierSpec.join_paxi 原样透出）
+        //   —— 直接用，绝不能再过 paxiToRaw（×10⁶ 后签名金额与合约差一百万倍，
+        //   SessionError 验签必失败 → 官方模板永远参与不进去）；
+        // * entry.join_tkcc 是 **TKCC 个数** —— 需要 ×10^decimals 换成 raw。
+        joinPaxiRaw = String(entry.join_paxi);
+        joinTkccRaw = L.tkccToRaw(entry.join_tkcc, tkccInfo.decimals);
       } else {
+        // 兜底：config.js 的 tiers 表是**人类可读单位**，两个都要换算
         const tpl = await L.poolTemplate(tid);
         if (!tpl) return banner('模板不存在', 'err');
         const t = C.tiers.find((x) => x.id === Number(tpl.tier));
         if (!t) return banner('模板档位非法：' + tpl.tier, 'err');
-        joinTkccCount = t.joinTkcc;
-        joinPaxiHuman = t.joinPaxi;
+        joinTkccRaw = L.tkccToRaw(t.joinTkcc, tkccInfo.decimals);
+        joinPaxiRaw = L.paxiToRaw(t.joinPaxi);
       }
-      const joinTkccRaw = L.tkccToRaw(joinTkccCount, tkccInfo.decimals);
-      const joinPaxiRaw = L.paxiToRaw(joinPaxiHuman);
       await L.activateTemplate(tid, joinTkccRaw, joinPaxiRaw);
       log(`参与模板 #${tid} 成功`);
       await S.syncNonce();

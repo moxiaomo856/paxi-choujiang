@@ -58,6 +58,10 @@ window.CJ_CONFIG = {
   sessionDailyLimit: '1000000000000',
   keepSeamless: true,
   sessionTtlHours: 24,
+  // 开启无感时预存给会话账户的 gas（upaxi）。0.3 PAXI 按每次参与 ~3 万
+  // upaxi 算约够 10 次操作；耗尽后参与会自动回退钱包签名路径，
+  // 重新「开启无感」即可再充。
+  sessionGasFund: '300000',
 
   // 列表自动轮询间隔（毫秒）。0 或省略则关闭轮询（仅切回页面可见时刷新）。
   // ⚠️ 之前这里漏配，而 app.js 用 `if (C.pollInterval > 0)` 判断，

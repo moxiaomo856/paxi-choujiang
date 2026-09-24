@@ -137,6 +137,19 @@ treasury: 'paxi194kpjqhyz7re2g749lc2030cgeg4sql5ldvyem', // 运营分成收款�
 
 会话 24 小时过期；交易失败会自动回滚本地 nonce，并从链上重新同步。
 
+### 真无感：会话私钥签名 + 直接广播（不弹钱包）
+
+「开启无感」的一笔交易里同时完成 **RegisterSession + 给会话地址转入 gas**
+（`sessionGasFund`，默认 0.3 PAXI）。之后：
+
+* **参与 / 建池 / 官方池参与** —— 由会话私钥本地构造 SignDoc 签名并直接广播，
+  **不弹钱包**，gas 从会话账户扣（约 3 万 upaxi/次，够 10 次左右）。
+  合约侧资金身份来自 auth（主钱包内部余额），与 tx 签名者无关。
+* **充值 / 提现 / 领奖 / 退款 / 管理操作** —— 仍走钱包签名（涉及主钱包身份或链上转账）。
+* 会话 gas 耗尽 → 参与自动回退钱包签名路径（弹一次钱包），重新「开启无感」即可再充。
+* 会话账户的 gas 余额可随时在区块浏览器查（开启无感时日志会打印该地址）；
+  「关闭无感」只撤销授权，旧会话账户里未用完的少量 gas 不退（金额很小）。
+
 ### 会话私钥存储与安全边界
 
 会话私钥存 `localStorage`，键名格式为 `cj_sess_priv__<主钱包地址>`
@@ -182,11 +195,23 @@ treasury: 'paxi194kpjqhyz7re2g749lc2030cgeg4sql5ldvyem', // 运营分成收款�
 
 ## 七、依赖
 
-CDN（index.html 内引入，无需构建）：
+**本地 vendor 优先，CDN 兜底**（index.html 加载器自动按序尝试）：
 
-* `@noble/secp256k1@2.1.0`
-* `@noble/hashes@1.4.0`（sha256 / ripemd160）
-* `bech32@2.0.0`
+| 库 | 本地文件（vendor/） | CDN 兜底 |
+| --- | --- | --- |
+| long（PaxiCosmJS 的 UMD 前置依赖） | `long.umd.js` | jsdelivr |
+| PaxiCosmJS（交易构建，§3.1） | `paxi-cosmjs.umd.js` | mainnet-api.paxinet.io |
+| @noble/secp256k1@2.1.0 | `secp256k1.mjs` | jsdelivr / esm.sh |
+| @noble/hashes@1.4.0（sha256 / ripemd160） | `hashes/*.js`（**ESM 版**，已修补裸包导入） | jsdelivr `/esm/` 路径 / esm.sh |
+| bech32@2.0.0 | `bech32.mjs`（本地 CJS→ESM 包装） | esm.sh |
+
+⚠️ **为什么必须本地 vendor**（历史教训，勿删）：
+
+1. jsdelivr 的 `/npm/@noble/hashes@x/sha256.js` 与 bech32 的 `dist/index.min.js` 都是 **CJS**，浏览器 `import()` 直接报错 —— noble-hashes 的 ESM 在 `/esm/` 子目录，bech32@2.0.0 根本没有 ESM 构建（本地文件是手工包装的）；
+2. noble-hashes ESM 里有裸包导入 `@noble/hashes/crypto`，浏览器解析不了，index.html 的 **importmap** 负责指到本地文件；
+3. `paxi-cosmjs.umd.js` 是 UMD 且依赖全局 `Long`，加载顺序必须 long 在前。
+
+部署时 **vendor/ 目录必须随站点一起上传**。node 下已对 sha256 / ripemd160 / bech32 地址编码 / secp256k1 签名 / 哈希链轮转做了全量用例验证。
 
 钱包：**仅支持** `window.paxihub`（PaxiHub App 内置浏览器）。
       PaxiHub 的 signAndSendTransaction 只签名，客户端自行组装 TxRaw

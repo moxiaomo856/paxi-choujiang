@@ -128,7 +128,22 @@
         daily_limit: String(C.sessionDailyLimit || '1000000000000'),
       },
     };
-    const res = await K.execute(msg, [], { gas: 400000, memo: 'register session' });
+
+    // 一笔交易同时完成「注册会话」+「给会话账户充 gas」：
+    // 之后参与 / 建池由会话私钥本地签名广播（真无感，不弹钱包），
+    // gas 从会话账户扣。每次开启都是新密钥对 → 新地址必然要充。
+    let res;
+    const gasFund = String(C.sessionGasFund || '300000');
+    if (K.executeRaw && K.buildExecAny && typeof PaxiCosmJS !== 'undefined') {
+      const anys = [
+        K.buildExecAny(K.wallet.address, C.contract, msg, []),
+        K.buildMsgSendAny(K.wallet.address, sessAddr, gasFund, C.coinMinimalDenom),
+      ];
+      res = await K.executeRaw(anys, { gas: 600000, memo: 'register session (+gas)' });
+    } else {
+      // 老加载环境兜底：仅注册（会话路径会因无 gas 自动回退钱包签名）
+      res = await K.execute(msg, [], { gas: 400000, memo: 'register session' });
+    }
     if (res.code !== 0) throw new Error(res.rawLog || '注册会话失败');
 
     state.sessPriv = privHex;

@@ -188,6 +188,55 @@
   }
 
   // ---------- 交易 ----------
+  /** hex → Uint8Array（会话公钥 / 会话签名用） */
+  const bytesOf = (hex) => Uint8Array.from((hex || '').match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+
+  /** 构造 wasm ExecuteContract 的 Any 消息 */
+  function buildExecAny(sender, contract, execMsg, funds) {
+    return PaxiCosmJS.Any.fromPartial({
+      typeUrl: '/cosmwasm.wasm.v1.MsgExecuteContract',
+      value: PaxiCosmJS.MsgExecuteContract.encode({
+        sender,
+        contract,
+        msg: new TextEncoder().encode(JSON.stringify(execMsg)),
+        funds: funds || [],
+      }).finish(),
+    });
+  }
+
+  /** 构造 Bank MsgSend 的 Any 消息（给会话账户充 gas 用） */
+  function buildMsgSendAny(from, to, amount, denom) {
+    return PaxiCosmJS.Any.fromPartial({
+      typeUrl: '/cosmos.bank.v1beta1.MsgSend',
+      value: PaxiCosmJS.MsgSend.encode({
+        fromAddress: from,
+        toAddress: to,
+        amount: [{ denom, amount }],
+      }).finish(),
+    });
+  }
+
+  /** 查某地址的链上 upaxi 余额（raw 字符串） */
+  async function getBankUpaxi(address) {
+    const bs = await getBankBalances(address);
+    const c = bs.find((b) => b.denom === C.coinMinimalDenom);
+    return c ? c.amount : '0';
+  }
+
+  function calcFee(gasOpt) {
+    const gas = String(gasOpt || C.defaultGas);
+    // gasPrice 是浮点（如 0.05 / 0.123）；放大到 1e9 再取整，
+    // 避免小数精度被截断导致手续费算错
+    const gpScaled = Math.round(C.gasPrice * 1e9);
+    return {
+      gas,
+      fee: {
+        amount: [{ denom: C.coinMinimalDenom, amount: String(Math.max(1, Math.ceil(Number(gas) * gpScaled / 1e9))) }],
+        gasLimit: gas,
+      },
+    };
+  }
+
   async function waitForTx(hash, timeoutMs = 60000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -233,17 +282,9 @@
 
     const { accountNumber, sequence } = await buildCommon(chainId, wallet.address);
 
-    // TxBody：msgs + memo
-    const msgs = [
-      PaxiCosmJS.Any.fromPartial({
-        typeUrl: '/cosmwasm.wasm.v1.MsgExecuteContract',
-        value: PaxiCosmJS.MsgExecuteContract.encode({
-          sender: wallet.address,
-          contract: opts.contract || C.contract,
-          msg: new TextEncoder().encode(JSON.stringify(execMsg)),
-          funds: funds || [],
-        }).finish(),
-      }),
+    // TxBody：rawMsgs（多消息，如 注册会话+充gas）优先；否则单条 ExecuteContract
+    const msgs = opts.rawMsgs || [
+      buildExecAny(wallet.address, opts.contract || C.contract, execMsg, funds),
     ];
     const txBody = PaxiCosmJS.TxBody.fromPartial({
       messages: msgs,
@@ -251,15 +292,7 @@
     });
 
     // Fee
-    const gas = String(opts.gas || C.defaultGas);
-    // gasPrice 是浮点（如 0.05 / 0.123）；放大到 1e9 再取整，
-    // 避免小数精度被截断导致手续费算错
-    const gpScaled = Math.round(C.gasPrice * 1e9);
-    const feeAmount = [{
-      denom: C.coinMinimalDenom,
-      amount: String(Math.max(1, Math.ceil(Number(gas) * gpScaled / 1e9))),
-    }];
-    const fee = { amount: feeAmount, gasLimit: gas };
+    const { gas, fee } = calcFee(opts.gas);
 
     // PubKey Any
     const pubkeyBytes = new Uint8Array(wallet.pubkeyHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
@@ -306,8 +339,11 @@
       authInfoBytes: signDoc.authInfoBytes,
       signatures: [sigBytes],
     });
-    const base64Tx = toBase64(PaxiCosmJS.TxRaw.encode(txRaw).finish());
+    return await broadcastAndWait(toBase64(PaxiCosmJS.TxRaw.encode(txRaw).finish()));
+  }
 
+  /** 广播 base64 交易（SYNC）→ 准入校验 → waitForTx 等最终执行结果 → 提取 wasm 事件 */
+  async function broadcastAndWait(base64Tx) {
     const broadcastRes = await fetchWithTimeout(`${C.lcd}/cosmos/tx/v1beta1/txs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -342,6 +378,81 @@
     }
     const attrs = extractWasmAttrs(confirmed.raw);
     return { code: 0, transactionHash: txhash, raw: confirmed.raw, attributes: attrs };
+  }
+
+  // ---------- 真无感：会话私钥本地签名 + 直接广播（不弹钱包） ----------
+  /**
+   * 适用范围：create_lottery / join_lottery / activate_template 三个操作 ——
+   * 合约里的资金身份全部来自 auth（主钱包），与 tx 签名者无关。
+   * gas 由会话账户支付（enable 时随注册一笔 BankSend 预存）。
+   *
+   * 前提：会话账户已在链上初始化（账户号存在）。没初始化 → 抛
+   * sessUnfunded，上层回退钱包签名路径（兼容本版之前开启的旧会话）。
+   */
+  async function executeViaSessionKey(execMsg, opts = {}) {
+    if (typeof PaxiCosmJS === 'undefined') {
+      throw new Error('PaxiCosmJS 库未加载，请检查网络');
+    }
+    const S = window.CJSession;
+    if (!S || !S.state.enabled || !S.state.sessPriv) {
+      throw new Error('无感会话未开启');
+    }
+    const chainId = await getChainId();
+
+    let acc;
+    try {
+      acc = await buildCommon(chainId, S.state.sessAddr);
+    } catch (e) {
+      const err = new Error('会话账户尚未初始化（无 gas）：' + (e.message || e));
+      err.sessUnfunded = true;
+      throw err;
+    }
+
+    // wasm 要求 msg.sender == tx 签名者 → 用会话地址作 sender
+    const msgs = [buildExecAny(S.state.sessAddr, opts.contract || C.contract, execMsg, [])];
+    const txBody = PaxiCosmJS.TxBody.fromPartial({
+      messages: msgs,
+      memo: opts.memo || 'session tx',
+    });
+    const { gas, fee } = calcFee(opts.gas);
+    const pubkeyAny = {
+      typeUrl: '/cosmos.crypto.secp256k1.PubKey',
+      value: PaxiCosmJS.PubKey.encode({ key: bytesOf(S.state.sessPubHex) }).finish(),
+    };
+    const authInfo = PaxiCosmJS.AuthInfo.fromPartial({
+      signerInfos: [{
+        publicKey: pubkeyAny,
+        modeInfo: { single: { mode: 1 } },
+        sequence: BigInt(acc.sequence),
+      }],
+      fee,
+    });
+    const signDoc = PaxiCosmJS.SignDoc.fromPartial({
+      bodyBytes: PaxiCosmJS.TxBody.encode(txBody).finish(),
+      authInfoBytes: PaxiCosmJS.AuthInfo.encode(authInfo).finish(),
+      chainId,
+      accountNumber: BigInt(acc.accountNumber),
+    });
+
+    // 会话私钥本地签名：Sign(SHA256(SignDoc 编码字节))，64 字节 compact
+    const sigHex = await window.CJHash.signBytes(
+      PaxiCosmJS.SignDoc.encode(signDoc).finish(),
+      S.state.sessPriv,
+    );
+    const txRaw = PaxiCosmJS.TxRaw.fromPartial({
+      bodyBytes: signDoc.bodyBytes,
+      authInfoBytes: signDoc.authInfoBytes,
+      signatures: [bytesOf(sigHex)],
+    });
+    return await broadcastAndWait(toBase64(PaxiCosmJS.TxRaw.encode(txRaw).finish()));
+  }
+
+  /** 多消息钱包交易（注册会话 + 充 gas 一笔完成）；rawMsgs 为已编码的 Any 数组 */
+  function executeRaw(rawMsgs, opts = {}) {
+    if (!Array.isArray(rawMsgs) || !rawMsgs.length) {
+      return Promise.reject(new Error('executeRaw：rawMsgs 为空'));
+    }
+    return serializeTx(() => executeViaPaxihub(null, [], { ...opts, rawMsgs }));
   }
 
   // ---------- chainId ----------
@@ -419,27 +530,62 @@
         throw err;
       }
 
-      const usedSession = needAuth;
-
-      let finalMsg = execMsg;
-      if (usedSession) {
+      if (needAuth) {
+        // ---- 真无感路径 ----
+        // 会话私钥本地签名 + 直接广播，不弹钱包、gas 由会话账户支付。
+        // 合约侧资金身份来自 auth（主钱包），与 tx 签名者无关。
         const { payload } = await window.CJSession.signPayload(
           execMsg,
           opts.session.action,
           opts.session.roundId,
           opts.session.amount
         );
-        finalMsg = payload;
+        try {
+          return await executeViaSessionKey(payload, opts);
+        } catch (e) {
+          if (e && e.sessUnfunded) {
+            // 兼容旧版开启的会话（会话账户没充过 gas）：
+            // 回退钱包签名路径 —— 本地 nonce 未上链，回滚后重签新 nonce
+            window.CJSession.rollbackNonce();
+            console.warn('会话账户无 gas，本次回退钱包签名路径');
+            const { payload: p2 } = await window.CJSession.signPayload(
+              execMsg,
+              opts.session.action,
+              opts.session.roundId,
+              opts.session.amount
+            );
+            try {
+              return await executeViaPaxihub(p2, funds, opts);
+            } catch (e2) {
+              if (!e2.txPending) window.CJSession.rollbackNonce();
+              throw e2;
+            }
+          }
+          // 以链上为准恢复 nonce：合约回滚时 nonce 未消费、txPending 但实际
+          // 成功时链上已 +1 —— 盲回滚在这两种场景下各错一次，链上同步永远对。
+          await window.CJSession.syncNonce().catch(() => {});
+          // nonce 漂移（如上次 txPending 实际成功）会让本笔预签的 nonce 无效
+          // → 换新 nonce 自动重试一次，避免用户手动重开无感
+          if (e && /nonce/i.test(String(e.message || e))) {
+            const { payload: p2 } = await window.CJSession.signPayload(
+              execMsg,
+              opts.session.action,
+              opts.session.roundId,
+              opts.session.amount
+            );
+            try {
+              return await executeViaSessionKey(p2, opts);
+            } catch (e2) {
+              await window.CJSession.syncNonce().catch(() => {});
+              throw e2;
+            }
+          }
+          throw e;
+        }
       }
 
-      try {
-        return await executeViaPaxihub(finalMsg, funds, opts);
-      } catch (e) {
-        // e.txPending = waitForTx 超时：交易可能已上链，此时回滚本地 nonce
-        // 会让本地比链上少 1，下一笔签名被判重放。只有确认没上链才回滚。
-        if (usedSession && !e.txPending) window.CJSession.rollbackNonce();
-        throw e;
-      }
+      // 非会话操作（充值 / 提现 / 领奖 / 退款 / 开奖 / 管理员）：钱包签名路径
+      return await executeViaPaxihub(execMsg, funds, opts);
     });
   }
 
@@ -452,7 +598,12 @@
     getChainId,
     queryContract,
     getBankBalances,
+    getBankUpaxi,
+    buildExecAny,
+    buildMsgSendAny,
+    executeRaw,
     execute,
+    executeViaSessionKey,
     waitForTx,
     extractWasmAttrs,
     fmt,
