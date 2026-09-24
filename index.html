@@ -170,17 +170,17 @@
 <script type="module">
   const errs = [];
   try {
-    window.nobleSecp256k1 = await import('https://cdn.jsdelivr.net/npm/@noble/secp256k1@2.1.0/index.min.js');
+    window.nobleSecp256k1 = await import('./secp256k1.js');
   } catch (e) { errs.push('secp256k1: ' + (e && e.message)); }
   try {
     const [s, r] = await Promise.all([
-      import('https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js'),
-      import('https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/ripemd160.js'),
+      import('./sha256.js'),
+      import('./ripemd160.js'),
     ]);
     window.nobleHashes = { sha256: s.sha256, ripemd160: r.ripemd160 };
   } catch (e) { errs.push('hashes: ' + (e && e.message)); }
   try {
-    const m = await import('https://cdn.jsdelivr.net/npm/bech32@2.0.0/dist/index.min.js');
+    const m = await import('./bech32.js');
     // 有些构建只给 default 导出，这里做兜底
     window.bech32 = m.bech32 || (m.default && m.default.bech32) || m.default;
   } catch (e) { errs.push('bech32: ' + (e && e.message)); }
