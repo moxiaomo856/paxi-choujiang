@@ -159,31 +159,76 @@
   <pre id="log" class="log"></pre>
 </div>
 
-<!-- PaxiCosmJS：paxihub 模式下 build SignDoc 需要（§3.1） -->
-<script src="https://mainnet-api.paxinet.io/resources/js/paxi-cosmjs.umd.js"></script>
-<!-- 密码学库（CDN，不自己实现原语）
-     ⚠️ @noble/secp256k1@2 与 @noble/hashes 的 dist 是 **ESM**，
-        普通 <script src> 加载会直接抛 "Unexpected token 'export'"，
-        window.nobleSecp256k1 / window.nobleHashes 根本不会存在，
-        hash.js / session.js 全部会因缺库而失败。
-        必须用动态 import() 引入后挂到 window，并在完成后广播 crypto-ready。 -->
+<!-- =====================================================================
+     交易/加密库加载器（本地 vendor 优先 + 多 CDN 兜底）
+     ⚠️ 三个历史教训（勿回退到"直接 import CDN 路径"的写法）：
+     1) jsdelivr 的 /npm/@noble/hashes@x/sha256.js 返回的是 **CJS**（含 require），
+        浏览器 import() 必炸 —— ESM 在 **/esm/** 子目录；
+     2) noble-hashes esm/utils.js 里有裸包导入 '@noble/hashes/crypto'，
+        浏览器解析不了，需要下方 importmap 指到本地文件；
+     3) bech32@2.0.0 整个包只有 CJS（vendor/bech32.mjs 是本地包装的 ESM）。
+     这些库下载于官方 npm 源，node 下全量用例验证通过（见 vendor/ 目录）。
+     ===================================================================== -->
+<!-- PaxiCosmJS 是 UMD 且依赖全局 Long，必须先于它加载 long -->
+<script src="./vendor/long.umd.js"></script>
+<script>
+  if (typeof Long === 'undefined') {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/long@5.2.3/umd/index.js"><\/script>');
+  }
+</script>
+<script src="./vendor/paxi-cosmjs.umd.js"></script>
+<script>
+  if (typeof PaxiCosmJS === 'undefined') {
+    document.write('<script src="https://mainnet-api.paxinet.io/resources/js/paxi-cosmjs.umd.js"><\/script>');
+  }
+</script>
+<!-- importmap：解析 noble-hashes ESM 里的裸包导入（远程兜底文件也需要它） -->
+<script type="importmap">
+{
+  "imports": {
+    "@noble/hashes/crypto": "./vendor/hashes/crypto.js",
+    "@noble/hashes/utils": "./vendor/hashes/utils.js"
+  }
+}
+</script>
 <script type="module">
   const errs = [];
+  async function importAny(label, urls) {
+    for (const u of urls) {
+      try { return await import(u); } catch (e) { errs.push(label + ' ← ' + u + ' : ' + (e && e.message)); }
+    }
+    throw new Error(label + '：所有源（本地 + CDN）均加载失败');
+  }
   try {
-    window.nobleSecp256k1 = await import('./secp256k1.js');
-  } catch (e) { errs.push('secp256k1: ' + (e && e.message)); }
+    window.nobleSecp256k1 = await importAny('secp256k1', [
+      './vendor/secp256k1.mjs',
+      'https://cdn.jsdelivr.net/npm/@noble/secp256k1@2.1.0/index.min.js',
+      'https://esm.sh/@noble/secp256k1@2.1.0',
+    ]);
+  } catch (e) { errs.push(e.message); }
   try {
     const [s, r] = await Promise.all([
-      import('./sha256.js'),
-      import('./ripemd160.js'),
+      importAny('hashes/sha256', [
+        './vendor/hashes/sha256.js',
+        'https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/esm/sha256.js',
+        'https://esm.sh/@noble/hashes@1.4.0/sha256',
+      ]),
+      importAny('hashes/ripemd160', [
+        './vendor/hashes/ripemd160.js',
+        'https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/esm/ripemd160.js',
+        'https://esm.sh/@noble/hashes@1.4.0/ripemd160',
+      ]),
     ]);
     window.nobleHashes = { sha256: s.sha256, ripemd160: r.ripemd160 };
-  } catch (e) { errs.push('hashes: ' + (e && e.message)); }
+  } catch (e) { errs.push(e.message); }
   try {
-    const m = await import('./bech32.js');
+    const m = await importAny('bech32', [
+      './vendor/bech32.mjs',
+      'https://esm.sh/bech32@2.0.0',
+    ]);
     // 有些构建只给 default 导出，这里做兜底
     window.bech32 = m.bech32 || (m.default && m.default.bech32) || m.default;
-  } catch (e) { errs.push('bech32: ' + (e && e.message)); }
+  } catch (e) { errs.push(e.message); }
   window.__cryptoErrors = errs;
   window.dispatchEvent(new Event('crypto-ready'));
 </script>

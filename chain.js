@@ -38,14 +38,18 @@
 
   /** raw → 人类可读（整数/小数分段换算，raw > 2^53 也不丢精度） */
   function fmt(raw, dec) {
+    // raw 是**最小单位整数**（如 upaxi），需要除以 10^dec 得到人类可读值。
+    // 全程用字符串 + BigInt，避免浮点误差和 > 2^53 精度丢失。
     if (raw === null || raw === undefined || raw === '') return '0';
     let s = String(raw).trim();
     const neg = s.startsWith('-');
     if (neg) s = s.slice(1);
-    const [i = '0', f = ''] = s.split('.');
-    const frac = (f + '0'.repeat(dec)).slice(0, dec);
-    let out = BigInt(i || '0').toLocaleString('zh-CN');
-    if (dec > 0 && frac) out += '.' + frac;
+    // 补足到至少 dec+1 位（保证整数部分至少 1 位）
+    s = s.padStart(dec + 1, '0');
+    const intPart = s.slice(0, s.length - dec) || '0';
+    const fracPart = dec > 0 ? s.slice(s.length - dec) : '';
+    let out = BigInt(intPart).toLocaleString('zh-CN');
+    if (fracPart) out += '.' + fracPart;
     return (neg ? '-' : '') + out;
   }
 

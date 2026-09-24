@@ -107,6 +107,11 @@
   // ---------- 钱包 / 会话 ----------
   async function onConnect() {
     const addr = await K.connect();
+    // 成功连接后清掉此前遗留的错误/警告横幅。典型场景：钱包还没注入完成时
+    // 手动点过"连接钱包"，报了"未检测到 PaxiHub 钱包"（err 类）；随后注入
+    // 完成、连接成功，但 banner('') 按设计只清 info 类，err 会一直挂着误导用户。
+    _bannerKind._k = 'info';
+    banner('');
     $('addr').innerHTML = copyable(addr, '地址', addr.slice(0, 10) + '…' + addr.slice(-6));
     $('btnSession').hidden = false;
     // 依赖 CDN 的加密库自检：连上就先确认，避免"提交时才失败、分不清是 CDN 还是合约"
