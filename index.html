@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <!-- 手机浏览器工具栏染色（与 --bg 一致），视觉上更像原生应用 -->
 <meta name="theme-color" content="#0f1115" />
+<!-- 纯手机项目：允许"添加到主屏幕"以全屏 App 方式运行 -->
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Paxi 抽奖" />
 <title>Paxi 抽奖</title>
 <link rel="stylesheet" href="styles.css" />
 </head>
@@ -31,7 +36,8 @@
       <div class="bal"><span class="k">链上 PAXI</span><span id="bankPaxi" class="v">0</span></div>
     </div>
     <div class="row wrap">
-      <input id="depAmount" class="inp" type="number" min="0" step="0.000001" placeholder="数量" />
+      <input id="depAmount" class="inp" type="number" min="0" step="0.000001"
+             placeholder="数量" enterkeyhint="done" />
       <select id="depToken" class="inp">
         <option value="paxi">PAXI</option>
         <option value="tkcc">TKCC</option>
@@ -66,13 +72,17 @@
     <div class="grid2">
       <label>销毁方式（开奖 6%）
         <select id="burnMode" class="inp">
-          <option value="burn">Burn —— 调用 TKCC 的 burn（真销毁，推荐）</option>
-          <option value="black_hole">BlackHole —— 转到黑洞地址</option>
+          <!-- P2-2：合约 BurnMode::default() = BlackHole，且销毁前会校验黑洞地址。
+               默认项必须与合约一致，否则管理员误选 burn 而 TKCC 不支持时会卡死奖池。 -->
+          <option value="black_hole" selected>BlackHole —— 转到黑洞地址（合约默认，推荐）</option>
+          <option value="burn">Burn —— 调用 TKCC 的 burn（真销毁，需先验证 TKCC 支持）</option>
           <option value="skip">Skip —— 转入金库（仅测试网）</option>
         </select>
       </label>
       <label>黑洞地址（仅 BlackHole 需要）
-        <input id="burnAddr" class="inp" placeholder="paxi1…" />
+        <input id="burnAddr" class="inp"
+               autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
+               placeholder="paxi1…" />
       </label>
     </div>
     <div class="row wrap">
@@ -86,12 +96,10 @@
     </p>
 
     <h2>管理员：模板管理</h2>
+    <p class="hint">simple 版模板只选档位；创建时自动生成随机哈希链（存本机 localStorage），开奖前在下方模板列表点"揭示下一个秘密"。</p>
     <div class="grid2">
-      <label>模板名<input id="tplName" class="inp" placeholder="入门池" /></label>
-      <label>参与费 PAXI（1–10）<input id="tplJoinPaxi" class="inp" type="number" min="1" max="10" value="1" /></label>
-      <label>参与费 TKCC（1万–10万）<input id="tplJoinTkcc" class="inp" type="number" min="10000" max="100000" value="10000" /></label>
-      <label>人数下限（5–50）<input id="tplMin" class="inp" type="number" value="5" min="5" max="50" /></label>
-      <label>人数上限（5–50）<input id="tplMax" class="inp" type="number" value="50" min="5" max="50" /></label>
+      <label>模板名<input id="tplName" class="inp" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="入门池" /></label>
+      <label>档位<select id="tplTier" class="inp"></select></label>
     </div>
     <button id="btnCreateTpl" class="btn primary block">创建模板</button>
     <div id="tplList" class="list"></div>
@@ -100,26 +108,19 @@
   <!-- 创建抽奖（A 模式：玩家自建池） -->
   <section class="card">
     <h2>创建抽奖（玩家自建池）</h2>
-    <p class="hint">建池需支付 <b>50 PAXI + 60 万 TKCC</b>，全额进入奖池。所有加入者按你设定的参与费支付，金额完全一致。</p>
+    <p class="hint">simple 版只有三档，费用与人数由档位决定。建池费全额进入奖池，所有加入者按同档参与费支付。</p>
     <div class="grid2">
-      <label>参与费 PAXI（1–10）
-        <input id="fJoinPaxi" class="inp" type="number" value="1" min="1" max="10" step="1" />
+      <label>档位
+        <select id="fTier" class="inp"></select>
       </label>
-      <label>参与费 TKCC（1万–10万）
-        <input id="fJoinTkcc" class="inp" type="number" value="10000" min="10000" max="100000" step="1000" />
+      <p class="hint" id="tierHint">—</p>
+      <p class="hint">到期时间由平台统一配置（默认 24 小时）。</p>
+      <label>随机秘密（可选，仅玩家自建池用）
+        <input id="fSecret" class="inp" type="text"
+               autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
+               placeholder="留空则用兜底随机源" />
       </label>
-      <label>人数下限（5–50）
-        <input id="fMin" class="inp" type="number" value="5" min="5" max="50" step="1" />
-      </label>
-      <label>人数上限（5–50）
-        <input id="fMax" class="inp" type="number" value="50" min="5" max="50" step="1" />
-      </label>
-      <label>时长（小时）
-        <input id="fHours" class="inp" type="number" value="24" min="1" max="168" step="1" />
-      </label>
-      <label>随机秘密（可选，commit-reveal）
-        <input id="fSecret" class="inp" type="text" placeholder="留空则用兜底随机源" />
-      </label>
+      <p class="hint">「随机秘密」只作用于你自建的池子（commit-reveal）；官方奖池的随机性由平台哈希链提供，与本项无关。</p>
     </div>
     <button id="btnCreate" class="btn primary block">创建</button>
   </section>
@@ -144,7 +145,9 @@
   <div id="revealBox" hidden>
     <div class="card">
       <h2>揭示秘密（抽奖 #<span id="revealLotteryId"></span>）</h2>
-      <input id="revealSecret" class="inp block" type="text" placeholder="建池时填写的随机秘密" />
+      <input id="revealSecret" class="inp block" type="text"
+             autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
+             placeholder="建池时填写的随机秘密" />
       <div class="acts">
         <button id="btnRevealConfirm" class="btn primary block">确认揭示</button>
         <button id="btnRevealCancel" class="btn ghost block">取消</button>
@@ -158,11 +161,32 @@
 
 <!-- PaxiCosmJS：paxihub 模式下 build SignDoc 需要（§3.1） -->
 <script src="https://mainnet-api.paxinet.io/resources/js/paxi-cosmjs.umd.js"></script>
-<!-- 密码学库（CDN，不自己实现原语） -->
-<script src="https://cdn.jsdelivr.net/npm/@noble/secp256k1@2.1.0/index.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/ripemd160.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/bech32@2.0.0/dist/index.min.js"></script>
+<!-- 密码学库（CDN，不自己实现原语）
+     ⚠️ @noble/secp256k1@2 与 @noble/hashes 的 dist 是 **ESM**，
+        普通 <script src> 加载会直接抛 "Unexpected token 'export'"，
+        window.nobleSecp256k1 / window.nobleHashes 根本不会存在，
+        hash.js / session.js 全部会因缺库而失败。
+        必须用动态 import() 引入后挂到 window，并在完成后广播 crypto-ready。 -->
+<script type="module">
+  const errs = [];
+  try {
+    window.nobleSecp256k1 = await import('https://cdn.jsdelivr.net/npm/@noble/secp256k1@2.1.0/index.min.js');
+  } catch (e) { errs.push('secp256k1: ' + (e && e.message)); }
+  try {
+    const [s, r] = await Promise.all([
+      import('https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/sha256.js'),
+      import('https://cdn.jsdelivr.net/npm/@noble/hashes@1.4.0/ripemd160.js'),
+    ]);
+    window.nobleHashes = { sha256: s.sha256, ripemd160: r.ripemd160 };
+  } catch (e) { errs.push('hashes: ' + (e && e.message)); }
+  try {
+    const m = await import('https://cdn.jsdelivr.net/npm/bech32@2.0.0/dist/index.min.js');
+    // 有些构建只给 default 导出，这里做兜底
+    window.bech32 = m.bech32 || (m.default && m.default.bech32) || m.default;
+  } catch (e) { errs.push('bech32: ' + (e && e.message)); }
+  window.__cryptoErrors = errs;
+  window.dispatchEvent(new Event('crypto-ready'));
+</script>
 
 <script src="hash.js"></script>
 <script src="config.js"></script>

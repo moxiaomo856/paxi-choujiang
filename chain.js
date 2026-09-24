@@ -36,17 +36,28 @@
     return btoa(binary);
   };
 
-  /** raw → 人类可读 */
+  /** raw → 人类可读（整数/小数分段换算，raw > 2^53 也不丢精度） */
   function fmt(raw, dec) {
     if (raw === null || raw === undefined || raw === '') return '0';
-    const n = Number(raw) / Math.pow(10, dec);
-    return n.toLocaleString('zh-CN', { maximumFractionDigits: dec });
+    let s = String(raw).trim();
+    const neg = s.startsWith('-');
+    if (neg) s = s.slice(1);
+    const [i = '0', f = ''] = s.split('.');
+    const frac = (f + '0'.repeat(dec)).slice(0, dec);
+    let out = BigInt(i || '0').toLocaleString('zh-CN');
+    if (dec > 0 && frac) out += '.' + frac;
+    return (neg ? '-' : '') + out;
   }
 
   /** public_key / pubkey 兼容：钱包可能返回数组（Uint8Array / Array），也可能返回 base64 字符串 */
   function pkToHex(pk) {
     if (pk == null) return '';
     if (typeof pk === 'string') {
+      // getAddress() 可能直接返回 hex 字符串，此时 atob 会解出乱码。
+      // 压缩公钥 33 字节 = 66 hex，非压缩 65 字节 = 130 hex。
+      if (/^[0-9a-fA-F]+$/.test(pk) && (pk.length === 66 || pk.length === 130)) {
+        return pk.toLowerCase();
+      }
       // base64 字符串 → decode 后转 hex
       const bin = atob(pk);
       return Array.from(bin).map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
@@ -68,7 +79,7 @@
   }
 
   // ---------- 钱包 ----------
-  const wallet = { address: '', pubkeyHex: '', kind: 'paxihub' };
+  const wallet = { address: '', pubkeyHex: '' };
 
   function detectWalletKind() {
     if (typeof window.paxihub !== 'undefined' && window.paxihub.paxi) return 'paxihub';
@@ -77,12 +88,25 @@
 
   const hasWallet = () => detectWalletKind() !== '';
 
+  /**
+   * PaxiHub 的桥接是**异步注入**的：脚本执行时 window.paxihub 可能还没挂上。
+   * 直接同步判空会误判成"没钱包"，在 App 内也会把用户深链跳出去。
+   */
+  async function waitForWallet(timeoutMs = 6000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (detectWalletKind()) return true;
+      await sleep(100);
+    }
+    return false;
+  }
+
   async function connect() {
+    if (!detectWalletKind()) await waitForWallet(2000);
     if (!detectWalletKind()) throw new Error('未检测到 PaxiHub 钱包。请在 PaxiHub App 内置浏览器打开本页面。');
     const info = await window.paxihub.paxi.getAddress();
     wallet.address = info.address;
     wallet.pubkeyHex = pkToHex(info.public_key);
-    wallet.kind = 'paxihub';
     return wallet.address;
   }
 
@@ -112,38 +136,49 @@
     const json = await res.json();
     const account = json.account || {};
     const ba = account.base_account || account;
+    // ⚠️ Cosmos SDK 里 account_number 的合法值就是 0，旧实现用 String(...) !== '0'
+    // 判断"未初始化"，会让 account_number=0 的真实账户（通常是新账户）直接报错。
+    const raw = ba.account_number;
+    if (raw === undefined || raw === null || raw === '') {
+      throw new Error('账户尚未在链上初始化（account_number 缺失）。请先接收一笔 PAXI 后重试。');
+    }
     return {
-      accountNumber: Number(ba.account_number || '0'),
+      accountNumber: Number(raw),
       sequence: Number(ba.sequence || '0'),
     };
   }
 
-  /** 把 CosmJS Any 格式的 msgs 转成 TxBody.messages 需要的 proto Any */
-  function toProtoAny(typeUrl, msgValueObj) {
-    return {
-      typeUrl,
-      value: toBase64(
-        PaxiCosmJS.MsgExecuteContract.encode({
-          sender: msgValueObj.sender,
-          contract: msgValueObj.contract,
-          msg: msgValueObj.msg,
-          funds: msgValueObj.funds || [],
-        }).finish()
-      ),
-    };
-  }
-
-  /** 从 tx_response.raw.logs 里提取 wasm 事件的 key/value（数组形式，供前端按 key 查找事件属性） */
+  /** 从 tx_response 提取 wasm 事件的 key/value（数组形式，供前端按 key 查找事件属性）
+   *
+   * 兼容三种 LCD 形态：
+   * 1) 顶层 txResponse.events（Cosmos SDK 0.47+ / 新版 LCD）——必须先查，
+   *    否则 lottery_id / template_id 拿不到，模板池哈希链存不进 localStorage；
+   * 2) txResponse.logs[].events（旧版）；
+   * 3) 部分老版本把 attribute key 做 base64 —— wasm 事件 key 都是 [a-z_]，
+   *    不匹配就尝试 atob 解码，解不动保底用原值。
+   */
   function extractWasmAttrs(txResponse) {
     const out = [];
-    const logs = (txResponse && txResponse.logs) || [];
-    for (const log of logs) {
-      for (const evt of (log.events || [])) {
-        if (evt.type !== 'wasm') continue;
-        for (const a of (evt.attributes || [])) {
-          out.push({ key: a.key, value: a.value });
-        }
+    const push = (evt) => {
+      const t = evt && evt.type;
+      if (!t || !(t === 'wasm' || t.startsWith('wasm-'))) return;
+      for (const a of (evt.attributes || [])) {
+        let k = a.key;
+        try {
+          if (k && !/^[a-z_]+$/.test(k)) k = atob(k);
+        } catch (_) { /* 保底用原值 */ }
+        out.push({ key: k, value: a.value });
       }
+    };
+    // 1) 顶层 events
+    for (const evt of ((txResponse && txResponse.events) || [])) push(evt);
+    // 2) logs[].events（旧版；部分 LCD 把 logs 返回成 JSON 字符串，先解析）
+    let logs = (txResponse && txResponse.logs) || [];
+    if (typeof logs === 'string') {
+      try { logs = JSON.parse(logs); } catch (e) { logs = []; }
+    }
+    for (const log of logs) {
+      for (const evt of (log.events || [])) push(evt);
     }
     return out;
   }
@@ -164,7 +199,11 @@
       }
       await sleep(1500);
     }
-    throw new Error('交易确认超时（链上可能已成功，请刷新查看）');
+    // 超时≠失败：交易可能已经上链。标记为 txPending，
+    // 让上层知道**不要**回滚会话 nonce（否则本地比链上少 1，下一笔会被判重放）。
+    const e = new Error(`交易确认超时（txhash=${hash}）。链上可能已成功，请稍后刷新列表确认。`);
+    e.txPending = true;
+    throw e;
   }
 
   /**
@@ -186,7 +225,9 @@
       throw new Error('PaxiCosmJS 库未加载，请检查网络');
     }
 
-    const { accountNumber, sequence } = await buildCommon(C.chainId, wallet.address);
+    const chainId = await getChainId();
+
+    const { accountNumber, sequence } = await buildCommon(chainId, wallet.address);
 
     // TxBody：msgs + memo
     const msgs = [
@@ -207,7 +248,13 @@
 
     // Fee
     const gas = String(opts.gas || C.defaultGas);
-    const feeAmount = [{ denom: C.coinMinimalDenom, amount: String(Math.max(1, Math.ceil(Number(gas) * C.gasPrice))) }];
+    // gasPrice 是浮点（如 0.05 / 0.123）；放大到 1e9 再取整，
+    // 避免小数精度被截断导致手续费算错
+    const gpScaled = Math.round(C.gasPrice * 1e9);
+    const feeAmount = [{
+      denom: C.coinMinimalDenom,
+      amount: String(Math.max(1, Math.ceil(Number(gas) * gpScaled / 1e9))),
+    }];
     const fee = { amount: feeAmount, gasLimit: gas };
 
     // PubKey Any
@@ -231,7 +278,7 @@
     const signDoc = PaxiCosmJS.SignDoc.fromPartial({
       bodyBytes: PaxiCosmJS.TxBody.encode(txBody).finish(),
       authInfoBytes: PaxiCosmJS.AuthInfo.encode(authInfo).finish(),
-      chainId: C.chainId,
+      chainId,
       accountNumber: BigInt(accountNumber),
     });
 
@@ -239,7 +286,7 @@
     const txObj = {
       bodyBytes: toBase64(signDoc.bodyBytes),    // 本地 toBase64，不要用 PaxiCosmJS.Encoder（不存在）
       authInfoBytes: toBase64(signDoc.authInfoBytes),
-      chainId: C.chainId,
+      chainId,
       accountNumber: String(signDoc.accountNumber),
     };
     const result = await window.paxihub.paxi.signAndSendTransaction(txObj);
@@ -280,8 +327,10 @@
     // Err(Expired) 会被当成成功，UI 显示"参与成功"但链上实际失败。
     const txhash = txr.txhash;
     if (!txhash) {
-      // 极少数情况 SYNC 不返回 txhash，只能兜底返回（合约实际执行状态未知）
-      return { code: 0, transactionHash: '', raw: txr };
+      // 拿不到 txhash 就无法二次确认，合约到底执行成功还是失败是未知的。
+      // 旧实现在这里返回 code:0，UI 会显示"参与成功"，但链上可能是失败的 ——
+      // 宁可报错让用户去区块浏览器核对，也不要给出假成功。
+      throw new Error('广播未返回 txhash，无法确认链上执行结果，请稍后刷新列表核对。');
     }
     const confirmed = await waitForTx(txhash);
     if (!confirmed.ok) {
@@ -291,45 +340,117 @@
     return { code: 0, transactionHash: txhash, raw: confirmed.raw, attributes: attrs };
   }
 
+  // ---------- chainId ----------
+  /**
+   * 链上 chainId（**会话签名原文的第一段，必须与交易签名用同一个值**）。
+   *
+   * 之前 session.js 用 config.js 的硬编码值、chain.js 用链上动态值，两者目前
+   * 恰好都是 `paxi-mainnet` 所以没暴露问题；一旦链改名或切链，交易能发出去、
+   * 但会话验签会**全量失败**（签名原文第一段就对不上），而且错误定位极难。
+   * 这里统一由 chain.js 取一次并缓存，两个用途共用同一个值。
+   */
+  let cachedChainId = '';
+  let cachedChainIdAt = 0;
+  const CHAIN_ID_TTL = 5 * 60 * 1000; // 5 分钟：链改名/切链最多 5 分钟内感知
+  async function getChainId() {
+    if (cachedChainId && Date.now() - cachedChainIdAt < CHAIN_ID_TTL) {
+      return cachedChainId;
+    }
+    try {
+      const r = await fetchWithTimeout(`${C.lcd}/cosmos/base/tendermint/v1beta1/node_info`, {}, 5000);
+      const j = await r.json();
+      const onchain = j && j.default_node_info && j.default_node_info.network;
+      if (onchain) {
+        if (onchain !== C.chainId) {
+          console.warn(`chainId 不一致：config=${C.chainId}，链上=${onchain}，改用链上值`);
+        }
+        cachedChainId = onchain;
+        cachedChainIdAt = Date.now();
+        return cachedChainId;
+      }
+    } catch (e) { /* 查不到就用 config 兜底 */ }
+    cachedChainId = C.chainId;
+    cachedChainIdAt = Date.now();
+    return cachedChainId;
+  }
+
   /**
    * 发送执行交易。
    * @param {object} execMsg ExecuteMsg，如 { join_lottery: { id: 1, auth } }
    * @param {Array}  funds   原生币 [{ denom, amount }]
    * @param {object} opts    { gas, memo, contract, session:{action,roundId,amount} }
    */
+  /**
+   * 交易串行队列。
+   *
+   * 每笔交易都会各自去 LCD 取一次 sequence。如果用户连点两下，两笔交易会拿到
+   * **同一个 sequence**，第二笔必然被节点以 "account sequence mismatch" 拒绝。
+   * 这里用一个 promise 链把所有发交易的动作串起来，保证前一笔落地后再取下一个
+   * sequence。前一笔失败不能阻塞后续，所以 then/catch 两边都放行。
+   */
+  let txQueue = Promise.resolve();
+  function serializeTx(fn) {
+    const run = txQueue.then(fn, fn);
+    txQueue = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
   async function execute(execMsg, funds = [], opts = {}) {
-    if (!wallet.address) await connect();
+    return serializeTx(async () => {
+      if (!wallet.address) await connect();
 
-    const usedSession = opts.session && window.CJSession && window.CJSession.state.enabled;
+      // P1-1：合约里 CreateLottery / JoinLottery / ActivateTemplate 的 `auth`
+      // 是**必填**字段（非 Option），而只有开启会话才会由 signPayload 注入。
+      // 未开启时消息会缺 auth，链上反序列化直接拒绝（missing field auth），
+      // 报错对普通用户完全不可读。这里提前拦下，给出能照做的提示。
+      const needAuth = !!opts.session;
+      if (needAuth && !(window.CJSession && window.CJSession.state.enabled)) {
+        const err = new Error(
+          '该操作需要「无感会话」签名：请先点右上角「开启无感」（只需一次），成功后再重试。'
+        );
+        err.needSession = true;
+        throw err;
+      }
 
-    let finalMsg = execMsg;
-    if (usedSession) {
-      const { payload } = await window.CJSession.signPayload(
-        execMsg,
-        opts.session.action,
-        opts.session.roundId,
-        opts.session.amount
-      );
-      finalMsg = payload;
-    }
+      const usedSession = needAuth;
 
-    try {
-      return await executeViaPaxihub(finalMsg, funds, opts);
-    } catch (e) {
-      if (usedSession) window.CJSession.rollbackNonce();
-      throw e;
-    }
+      let finalMsg = execMsg;
+      if (usedSession) {
+        const { payload } = await window.CJSession.signPayload(
+          execMsg,
+          opts.session.action,
+          opts.session.roundId,
+          opts.session.amount
+        );
+        finalMsg = payload;
+      }
+
+      try {
+        return await executeViaPaxihub(finalMsg, funds, opts);
+      } catch (e) {
+        // e.txPending = waitForTx 超时：交易可能已上链，此时回滚本地 nonce
+        // 会让本地比链上少 1，下一笔签名被判重放。只有确认没上链才回滚。
+        if (usedSession && !e.txPending) window.CJSession.rollbackNonce();
+        throw e;
+      }
+    });
   }
 
   window.CJChain = {
     C,
     wallet,
     hasWallet,
+    waitForWallet,
     connect,
+    getChainId,
     queryContract,
     getBankBalances,
     execute,
     waitForTx,
+    extractWasmAttrs,
     fmt,
     toRaw,
     toBase64,

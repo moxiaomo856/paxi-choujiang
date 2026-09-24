@@ -18,8 +18,8 @@ window.CJ_CONFIG = {
   // ---- 签名域名（必须与合约 state.rs 的 SIGN_DOMAIN 一致）----
   signDomain: 'lottery',
 
-  // ---- 合约（部署后填）----
-  contract: 'PASTE_LOTTERY_CONTRACT_ADDRESS_HERE',
+  // ---- 合约（已部署：paxi-lottery-contract-simple 主网地址）----
+  contract: 'paxi183js7jj7lceqpw6v2j9yagwet673gyeqvy9k5d58nwtjp0p9azpqsctvms',
   // TKCC 外部 PRC-20 合约地址（已发币，直接写死在这里）。
   // 运行时优先用合约 {"tkcc":{}} 的返回值；合约尚未 SetTkccToken 时用这里的地址兜底。
   tkccToken: 'paxi1s353hkvev2xtv5076wr5l2v6wy4tl9ph872g0puupakcx2p6rkls8q3vms',
@@ -38,17 +38,17 @@ window.CJ_CONFIG = {
   // 运营金库：抽奖运营分成（A 池 14%/15%，模板池 28%/30%）全部进这里
   treasury: 'paxi194kpjqhyz7re2g749lc2030cgeg4sql5ldvyem',
 
-  // ---- 业务默认值（与 LotteryConfig 默认一致）----
-  // A 模式（玩家自建池）：建池费 50 PAXI + 60 万 TKCC
-  createFeePaxi: 50,
-  createFeeTkcc: 600000,
-  joinPaxiMin: 1,
-  joinPaxiMax: 10,
-  joinTkccMin: 10000,
-  joinTkccMax: 100000,
-  peopleMin: 5,
-  peopleMax: 50,
-  defaultPeople: 5,
+  // ---- 三档规格（必须与合约 state.rs::tier_spec 严格一致，改合约就要改这里）----
+  // tier: 0=5 人档 / 1=20 人档 / 2=50 人档
+  // joinPaxi/joinTkcc 为每人参与费；createPaxi/createTkcc 为建池费（TKCC 均为个数）
+  tiers: [
+    { id: 0, label: '5 人档', people: 5, joinPaxi: 1, joinTkcc: 10000, createPaxi: 1, createTkcc: 20000 },
+    { id: 1, label: '20 人档', people: 20, joinPaxi: 2, joinTkcc: 20000, createPaxi: 15, createTkcc: 100000 },
+    { id: 2, label: '50 人档', people: 50, joinPaxi: 10, joinTkcc: 100000, createPaxi: 60, createTkcc: 600000 },
+  ],
+  defaultTier: 0,
+  // ⚠️ 仅 UI 文案：simple 版合约的抽奖时长由链上 LotteryConfig::default()（24h）
+  // 决定，前端没有任何消息能改它。改这里不会影响链上行为。
   durationHours: 24,
   // B2 模式（官方模板池）：是否展示"官方奖池"区块
   showTemplatePools: true,
@@ -58,4 +58,9 @@ window.CJ_CONFIG = {
   sessionDailyLimit: '1000000000000',
   keepSeamless: true,
   sessionTtlHours: 24,
+
+  // 列表自动轮询间隔（毫秒）。0 或省略则关闭轮询（仅切回页面可见时刷新）。
+  // ⚠️ 之前这里漏配，而 app.js 用 `if (C.pollInterval > 0)` 判断，
+  // undefined > 0 === false → 抽奖列表永远不自动刷新。与社交端保持一致。
+  pollInterval: 8000,
 };

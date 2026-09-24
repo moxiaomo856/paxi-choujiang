@@ -90,7 +90,9 @@
     const { token, decimals } = await resolveTkcc();
     if (!token) throw new Error('TKCC 未配置（合约尚未 SetTkccToken）');
     const amount = tkccToRaw(humanAmount, decimals);
-    const hook = K.toBase64(JSON.stringify({ deposit: {} }));
+    // hook 用 UTF-8 字节再 base64：toBase64(String) 走的是文本路径，
+    // 对含多字节字符的 JSON 才严格等价；统一走字节路径避免编码歧义
+    const hook = K.toBase64(new TextEncoder().encode(JSON.stringify({ deposit: {} })));
     return K.execute(
       { send: { contract: C.contract, amount, msg: hook } },
       [],
@@ -106,29 +108,22 @@
   }
 
   /**
-   * 建池（走无感签名）。
-   * amount 进签名原文 = PAXI 建池费 + TKCC 建池费 的 raw 总和，
-   * 必须与合约端一致（合约用 create_fee_paxi + to_tkcc_units(create_fee_tkcc)），
-   * 否则签名验证失败，且 PAXI 建池费会绕过会话日限额（HIGH-1）。
+   * 建池（simple 版，走无感签名）：只选档位，费用由前端 tiers 表算出。
+   * amount 进签名原文 = 该档建池费 PAXI + TKCC 的 raw 总和，
+   * 必须与合约端 tier_spec 一致，否则签名验证失败。
    */
   async function createLottery(opts) {
-    const { joinPaxi, joinTkcc, minPeople, maxPeople, commitHash } = opts;
+    const { tier, commitHash } = opts;
+    const t = C.tiers.find((x) => x.id === Number(tier));
+    if (!t) throw new Error('非法档位');
     const tkccInfo = await resolveTkcc();
-    // amount = PAXI 费 + TKCC 费（raw 总和），覆盖本次全部资金流出
-    const feeTkccRaw = tkccToRaw(C.createFeeTkcc, tkccInfo.decimals);
-    const feePaxiRaw = paxiToRaw(C.createFeePaxi);
+    const feeTkccRaw = tkccToRaw(t.createTkcc, tkccInfo.decimals);
+    const feePaxiRaw = paxiToRaw(t.createPaxi);
     const totalAmount = (BigInt(feeTkccRaw) + BigInt(feePaxiRaw)).toString();
     return K.execute(
       {
         create_lottery: {
-          join_paxi: paxiToRaw(joinPaxi),
-          // ⚠️ `join_tkcc` 的语义是「TKCC 个数」，与合约端 `cfg.min/max_join_tkcc`
-          //（1万–10万，均为个数）的范围判断一致；合约内部才会 to_tkcc_units 转 raw。
-          // 历史 bug：这里曾误用 tkccToRaw()，10000 → 10^10 >> max=100000，
-          // 导致 A 模式建池必然报 JoinFeeOutOfRange（B2 模板的 createPoolTemplate 是对的）。
-          join_tkcc: String(joinTkcc),
-          min_people: Number(minPeople),
-          max_people: Number(maxPeople),
+          tier: Number(tier),
           commit_hash: commitHash || null,
         },
       },
@@ -184,28 +179,111 @@
   }
 
   /**
-   * 管理员：创建模板。
+   * 管理员：创建模板（simple 版：只选档位）。
    *
-   * ⚠️ `PoolTemplate` 的两个参与费**单位不对称**（注意：与 `Lottery` 池子不同，池子两个都是 raw）：
-   *   - `join_paxi` —— **raw**（upaxi 最小单位）  → 这里 `paxiToRaw()`
-   *   - `join_tkcc` —— **个数**，合约内部再 ×10^decimals → 这里传**个数**，不要转 raw
-   * 该约定与合约 `state.rs::PoolTemplate` 的字段注释一致；
-   * 改动此处务必同步 `app.js::onActivate` 的读取换算，否则无感签名 amount 会算错。
+   * 同时自动生成一条随机哈希链（默认 64 个值）：
+   *   sN 随机 64-hex，s_i = sha256(s_{i+1})；提交给合约的承诺 = sha256(s1)。
+   * 整条链（不含已提交的承诺）存 localStorage：cj_tpl_chain_<template_id>。
+   * 每次开奖前用 revealTemplateSecret() 揭示一个；换设备 / 清缓存会**永久丢失**，
+   * 届时该模板的池子只能退款，务必备份。
    */
-  function createPoolTemplate(name, joinPaxiHuman, joinTkccCount, minPeople, maxPeople) {
-    return K.execute(
+  async function createPoolTemplate(name, tier, chainLen = 64) {
+    if (!(window.CJHash && (await window.CJHash.ready()))) {
+      throw new Error('加密库未加载，无法生成秘密链；请检查网络后重试');
+    }
+    const { commit, chain } = genSecretChain(chainLen);
+    const res = await K.execute(
       {
         create_pool_template: {
           name,
-          join_paxi: paxiToRaw(joinPaxiHuman),
-          join_tkcc: String(joinTkccCount),
-          min_people: Number(minPeople),
-          max_people: Number(maxPeople),
+          tier: Number(tier),
+          commit_hash: commit,
         },
       },
       [],
       { gas: 600000, memo: 'create template' }
     );
+    // 从事件里拿 template_id 存链
+    const tid = res.attributes?.find((a) => a.key === 'template_id')?.value;
+    if (tid) {
+      try {
+        localStorage.setItem('cj_tpl_chain_' + tid, JSON.stringify(chain));
+      } catch (e) { /* 忽略存储失败，banner 会提示手动备份 */ }
+    }
+    return { res, tid, chainLen: chain.length };
+  }
+
+  /**
+   * 管理员：揭示模板的下一个秘密（从本机链里取队首）。返回揭示值。
+   *
+   * 前置校验（软门禁）：
+   * * 无活跃池 → 直接拦截（揭示纯属浪费一个 secret）。
+   * * 活跃池未满员 → **软警告**，err.needForce = true；管理员再点一次
+   *   （force = true）即可强制揭示。
+   *
+   * ⚠️ 为什么"未满员"不能硬拦：满员池的指针会被下一个 ActivateTemplate
+   * 覆盖（P1 满员 → 用户 F 激活 → 指针切到 P2，count=1/5）。此时之前的
+   * 满员池 P1 仍在等揭示，合约端完全放行（只对 Open 且过期禁止），若前端
+   * 硬拦，P1 就卡到过期退款。所以未满员只提示、不阻止，由管理员判断。
+   * 两个满员池即使共用同一 secret 开奖，candidate set 与 pool_id 都不同，
+   * 结果彼此独立，无安全风险。
+   */
+  async function revealTemplateSecret(templateId, force = false) {
+    const tid = Number(templateId);
+    const active = await activePoolOfTemplates().catch(() => ({ entries: [] }));
+    const entry = (active.entries || []).find((e) => e.template_id === tid);
+    // ⚠️ entry 缺失有两种可能：模板真的没有活跃池，或模板被停用
+    //（active_pool_of_templates 会跳过 inactive 模板，但合约揭示并不要求
+    // 模板 active）。后者下可能有满员池在等揭示 —— 所以降级为软警告，
+    // 管理员确认后可强制。
+    if (!entry || entry.active_pool_id == null) {
+      if (!force) {
+        const err = new Error(
+          '未查到该模板的活跃池（可能没有活跃池，或模板已停用）。若确有满员池在等待揭示，请再点一次确认强制执行。'
+        );
+        err.needForce = true;
+        throw err;
+      }
+    } else if (entry.participant_count < entry.max_people && !force) {
+      const err = new Error(
+        '当前活跃池尚未满员（' + entry.participant_count + '/' + entry.max_people
+        + '）。若这是之前的满员池在等待揭示（活跃池指针已被新池覆盖），请再点一次"揭示"确认强制执行。'
+      );
+      err.needForce = true;
+      throw err;
+    }
+    const key = 'cj_tpl_chain_' + tid;
+    let chain;
+    try { chain = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { chain = null; }
+    if (!Array.isArray(chain) || !chain.length) {
+      throw new Error('本机没有模板 #' + tid + ' 的秘密链（换设备 / 清缓存会丢失）。若已丢失，该模板的池子只能退款。');
+    }
+    const secret = chain.shift();
+    await K.execute(
+      { admin_custom: { reveal_template_secret: { template_id: tid, secret } } },
+      [],
+      { gas: 400000, memo: 'reveal template secret' }
+    );
+    try { localStorage.setItem(key, JSON.stringify(chain)); } catch (e) { /* 忽略 */ }
+    return secret;
+  }
+
+  /** 生成随机哈希链：sN 随机，s_i = sha256(s_{i+1})；commit = sha256(s1) */
+  function genSecretChain(len) {
+    const chain = [];
+    let cur = randomHex64();
+    for (let i = 0; i < len; i++) {
+      chain.unshift(cur);
+      cur = window.CJHash.sha256Hex(cur);
+    }
+    const commit = window.CJHash.sha256Hex(chain[0]);
+    return { commit, chain };
+  }
+
+  function randomHex64() {
+    const b = new Uint8Array(32);
+    crypto.getRandomValues(b);
+    return Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
   }
 
   const updatePoolTemplate = (id, active) =>
@@ -213,22 +291,6 @@
       gas: 400000,
       memo: 'update template',
     });
-
-  const updatePoolTemplateParams = (id, opts) =>
-    K.execute(
-      {
-        update_pool_template_params: {
-          id: Number(id),
-          name: opts && opts.name != null ? opts.name : null,
-          join_paxi: opts && opts.joinPaxiHuman != null ? paxiToRaw(opts.joinPaxiHuman) : null,
-          join_tkcc: opts && opts.joinTkccCount != null ? String(opts.joinTkccCount) : null,
-          min_people: opts && opts.minPeople != null ? Number(opts.minPeople) : null,
-          max_people: opts && opts.maxPeople != null ? Number(opts.maxPeople) : null,
-        },
-      },
-      [],
-      { gas: 500000, memo: 'update template params' }
-    );
 
   const drawLottery = (id) =>
     K.execute({ draw_lottery: { id: Number(id) } }, [], { gas: 800000, memo: 'draw lottery' });
@@ -302,14 +364,16 @@
 
   /** 把链上 Lottery 对象转成便于渲染的视图（含 UTC 过期时间） */
   function toView(l, tkccDecimals) {
+    const tier = C.tiers.find((t) => t.id === Number(l.tier));
     return {
       id: l.id,
       creator: l.creator,
+      tier: l.tier,
+      tierLabel: tier ? tier.label : '档位' + l.tier,
       joinPaxi: fmtPaxi(l.join_paxi),
       joinPaxiRaw: l.join_paxi,
       joinTkcc: fmtTkcc(l.join_tkcc, tkccDecimals),
       joinTkccRaw: l.join_tkcc,
-      minPeople: l.min_people,
       maxPeople: l.max_people,
       // M2：开奖后 pool_* 归零，历史奖池在 settled_pool_*；
       // 展示时优先用快照，避免"奖池显示 0"或"仍显示原值"的误导。
@@ -324,7 +388,10 @@
       payout: l.payout,
       seed: l.seed,
       randomSource: l.random_source,
-      needsReveal: !!l.commit_hash && !l.revealed,
+      // needsReveal 只描述**玩家池**（A 模式）：建池者承诺了但还没揭示。
+      // 模板池的 revealed 恒为 None（揭示值存 TEMPLATE_SECRETS 查表、不回写池子），
+      // 不能用这两个字段判断 —— 否则官方池永远显示"未揭示"，误导管理员。
+      needsReveal: !!l.commit_hash && !l.revealed && !l.is_template_pool,
       // 双模式标记
       isTemplatePool: !!l.is_template_pool,
       templateId: l.template_id == null ? null : l.template_id,
@@ -337,7 +404,7 @@
     poolTemplates, poolTemplate, activePoolOfTemplates,
     depositPaxi, depositTkcc, withdraw,
     createLottery, joinLottery, activateTemplate, drawLottery, claim, refund, revealSecret,
-    createPoolTemplate, updatePoolTemplate, updatePoolTemplateParams,
+    createPoolTemplate, revealTemplateSecret, genSecretChain, updatePoolTemplate,
     setTkccToken, setTkccBurnAddress, setTkccBurnMode, setTreasury,
     paxiToRaw, tkccToRaw, fmtPaxi, fmtTkcc, toView, statusText,
   };

@@ -24,12 +24,16 @@ body {
 .brand { font-size: 18px; font-weight: 700; }
 .wallet { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .addr { color: var(--muted); font-size: 12px; }
-/* 可点击复制（手机端长按选择体验差，故加提示与触控目标） */
+/* 可点击复制（手机端长按选择体验差，故加提示与触控目标）
+   允许文本选择：复制失败时的兜底提示是"长按手动选择"，
+   若 user-select:none 用户连手动选都选不了。-webkit-touch-callout 只禁
+   长按弹出的系统菜单，不禁选择本身。 */
 .copyable {
   cursor: pointer;
   border-bottom: 1px dashed var(--muted);
   padding-bottom: 1px;
-  -webkit-user-select: none; user-select: none;
+  -webkit-user-select: text; user-select: text;
+  -webkit-touch-callout: none;
   touch-action: manipulation;
 }
 .copyable:active { opacity: .55; }
@@ -42,7 +46,6 @@ body {
     content: '';
     position: absolute;
     inset: -10px -6px;
-    z-index: -1;
   }
 }
 .tag { background: rgba(46,204,113,.15); color: var(--ok); padding: 2px 8px; border-radius: 10px; font-size: 12px; }
@@ -57,7 +60,8 @@ body {
 .btn.ghost { background: transparent; }
 .btn.block { width: 100%; margin-top: 10px; padding: 10px; }
 .btn.sm { padding: 5px 10px; font-size: 12px; }
-.btn:disabled { opacity: .5; cursor: not-allowed; }
+/* 交易在途 / 不可用态：唯一一条 .btn:disabled 规则（合并重复定义） */
+.btn:disabled { opacity: .55; cursor: not-allowed; pointer-events: none; }
 
 .inp {
   background: #10131a; border: 1px solid var(--line); color: var(--txt);
@@ -73,6 +77,14 @@ select.inp { min-width: 100px; }
 .banner.info { background: rgba(255,107,53,.12); color: var(--pri2); }
 .banner.warn { background: rgba(245,166,35,.12); color: var(--warn); }
 .banner.err { background: rgba(255,77,79,.12); color: var(--err); }
+
+/* 交易在途按钮（guardBusy 设置 disabled，这里补一个"别再点了"的视觉态）
+   —— 样式已合并进 .btn 规则区的唯一一条 .btn:disabled */
+
+/* 桌面端扫码引导卡片（手机端永不渲染） */
+.qr-box { display: flex; justify-content: center; padding: 12px 0 6px; }
+/* 二维码必须放在白底上，深色背景下扫码器识别率极低 */
+.qr-box img, .qr-box canvas, .qr-box table { background: #fff; padding: 8px; border-radius: 8px; }
 
 .row { display: flex; gap: 10px; align-items: center; }
 .row.wrap { flex-wrap: wrap; margin-top: 10px; }
@@ -117,7 +129,7 @@ select.inp { min-width: 100px; }
 
 /* —— 触屏基础（所有尺寸生效，桌面上无副作用）—— */
 html { -webkit-text-size-adjust: 100%; }
-body { overflow-x: clip; -webkit-tap-highlight-color: transparent; }
+body { overflow-x: hidden; overflow-x: clip; -webkit-tap-highlight-color: transparent; }
 .btn, .tab, .chip, select {
   touch-action: manipulation;                       /* 去掉双击缩放的 300ms 延迟 */
   -webkit-user-select: none; user-select: none;
@@ -131,19 +143,20 @@ body { overflow-x: clip; -webkit-tap-highlight-color: transparent; }
   .app { padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
 }
 
-/* 揭示秘密弹窗（commit-reveal 抽奖）：modal 化，避免手机端看不到 */
+/* 揭示秘密弹窗（commit-reveal 抽奖）：modal 化，避免手机端看不到
+   垂直居中 + dvh：软键盘弹起时 dvh 随可视高度收缩，卡片不会被顶出屏幕 */
 #revealBox {
   position: fixed; inset: 0; z-index: 100;
   background: rgba(0, 0, 0, .6);
   display: flex; align-items: center; justify-content: center;
-  padding: 20px;
+  padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
   -webkit-overflow-scrolling: touch;
 }
 #revealBox[hidden] { display: none; }
 #revealBox .card {
   max-width: 480px; width: 100%;
   margin: 0;
-  max-height: calc(100vh - 40px);
+  max-height: min(70vh, 65dvh);
   overflow-y: auto;
 }
 

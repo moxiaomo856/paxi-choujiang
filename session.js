@@ -43,13 +43,25 @@
 
   /** 升级清理：清掉旧格式 key（没有 __<addr> 后缀的遗留数据）
    *  模块加载时 K.wallet.address 为空，sk(b) 会得到 b__anon，从没被写过（persist 要 address）。
-   *  真正需要清的是 localStorage 里直接以 LS 值为 key 的遗留条目。*/
+   *  真正需要清的是 localStorage 里直接以 LS 值为 key 的遗留条目。
+   *  L-3：一次性标记统一放 META JSON 对象（避免散落 __cj_xxx / __cj_yyy 多键），
+   *       META.key 带应用前缀，将来可扩展更多 flag。*/
+  const META_KEY = '__cj_session_meta';
+  function getMeta() {
+    try { return JSON.parse(localStorage.getItem(META_KEY) || '{}'); } catch { return {}; }
+  }
+  function setMeta(key, val) {
+    const m = getMeta(); m[key] = val;
+    try { localStorage.setItem(META_KEY, JSON.stringify(m)); } catch {}
+  }
   function _wipeLegacyLocalStorage() {
+    if (getMeta().legacy_wiped) return;
     try {
       const prefixes = Object.values(LS);
       for (const k of Object.keys(localStorage)) {
         if (prefixes.includes(k)) localStorage.removeItem(k);
       }
+      setMeta('legacy_wiped', Date.now());
     } catch (_) { /* 某些环境禁用 localStorage 也别炸 */ }
   }
 
@@ -87,8 +99,23 @@
   /** 开启无感（唯一一次弹钱包） */
   async function enable() {
     if (!K.wallet.address) await K.connect();
-    if (!window.CJHash || !window.CJHash.ready()) {
+    if (!window.CJHash || !(await window.CJHash.ready())) {
       throw new Error('加密库未就绪（secp256k1 / hashes / bech32 CDN 未加载）');
+    }
+
+    // 注册新会话前先撤销本地遗留的旧会话：
+    // enable() 每次都生成新密钥对，不清旧的话旧 session 会一直占着链上
+    // RegisterSession 的每主钱包会话上限（MAX_SESSIONS_PER_USER）。
+    // 旧会话已过期 / 已被撤销时报错无所谓，clear() 会把本地状态清掉。
+    if (state.sessAddr && state.sessUser === K.wallet.address) {
+      try {
+        await K.execute(
+          { revoke_session: { session_addr: state.sessAddr } },
+          [],
+          { gas: 300000, memo: 'revoke old session' }
+        );
+      } catch (_) { /* 旧会话已过期/已撤销都无所谓 */ }
+      clear();
     }
 
     const { privHex, pubHex } = window.CJHash.genKeyPair();
@@ -134,9 +161,16 @@
     return state.sessNonce;
   }
 
-  function buildMessage(action, roundId, amount, nonce) {
+  /**
+   * 签名原文（第一段 chainId 必须**与交易签名同源**）。
+   *
+   * P3-1：原先这里用 config.js 的硬编码 `C.chainId`，而 chain.js 取链上值。
+   * 两者目前都是 `paxi-mainnet` 所以看不出问题；一旦链改名或换链，交易能正常
+   * 发出、会话验签却会全量失败，且很难定位。统一走 `K.getChainId()`。
+   */
+  async function buildMessage(action, roundId, amount, nonce) {
     return [
-      C.chainId,
+      await K.getChainId(),
       C.contract,
       C.signDomain,
       action,
@@ -157,8 +191,8 @@
   async function signPayload(execMsg, action, roundId, amount) {
     if (!state.enabled) throw new Error('未开启无感会话');
     const nonce = state.sessNonce;
-    const message = buildMessage(action, roundId, amount, nonce);
-    const signature = window.CJHash.signHash(message, state.sessPriv);
+    const message = await buildMessage(action, roundId, amount, nonce);
+    const signature = await window.CJHash.signHash(message, state.sessPriv);
 
     const key = Object.keys(execMsg)[0];
     const payload = {
