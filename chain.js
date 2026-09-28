@@ -1,15 +1,8 @@
 /* =====================================================================
- * chain.js —— 钱包连接 + 链上查询 / 交易
+ * chain.js —— 钱包连接 + 链上查询 / 交易（仅支持 PaxiHub App）
  *
- * 钱包适配层：仅支持 PaxiHub App（手机端）
- *   window.paxihub
- *     API: hub.paxi.getAddress() → { address, public_key }
- *          hub.paxi.signAndSendTransaction({ bodyBytes, authInfoBytes, chainId, accountNumber })
- *          ⚠️ signAndSendTransaction 只签名，不广播！
- *             拿到 result.success（签名 base64）后，需自行组装 TxRaw 并 POST 到 LCD 广播。
- *             见下方 executeViaPaxihub。
- *
- * 未检测到 window.paxihub → hasWallet() 返回 false，触发 UI 兜底（提示用 PaxiHub 打开）。
+ * ⚠️ signAndSendTransaction 只签名不广播：拿到 result.success 后需自行
+ *    组装 TxRaw 再 POST 到 LCD（见 executeViaPaxihub）。
  * ===================================================================== */
 (function () {
   const C = window.CJ_CONFIG;
@@ -259,21 +252,8 @@
     throw e;
   }
 
-  /**
-   * 用 paxihub 发交易（§3.4 buildAndSendTx 的精简版）。
-   * 只走 wasm ExecuteContract，其余类型暂不需要。
-   *
-   * 流程：构造 SignDoc → signAndSendTransaction 让钱包签名（返回 success=base64 签名）
-   *       → 组装 TxRaw → POST 到 LCD /cosmos/tx/v1beta1/txs 广播（SYNC 模式，只等 mempool 准入）
-   *       → waitForTx 轮询链上最终执行结果 → 从 logs 提取 attributes → 返回。
-   *
-   * ⚠️ 旧注释说"signAndSendTransaction 内部完成签名+广播"是错的！
-   *    指南 §3.4 明确写了：拿到 result.success（签名 base64）后必须自己组装 TxRaw 广播。
-   *    另外 BROADCAST_MODE_SYNC 只做准入检查，合约里的 Err(TkccNotConfigured) /
-   *    Err(AlreadyJoined) / Err(Expired) 等必须靠 waitForTx 二次确认，否则会被当成成功。
-   */
+  /** 钱包签名路径：SignDoc → 钱包签名 → TxRaw → 广播 */
   async function executeViaPaxihub(execMsg, funds, opts) {
-    // 先等钱包库加载完
     if (typeof PaxiCosmJS === 'undefined') {
       throw new Error('PaxiCosmJS 库未加载，请检查网络');
     }
@@ -319,9 +299,8 @@
       accountNumber: BigInt(accountNumber),
     });
 
-    // §3.4 signAndSendTransaction —— 注意：这一步只签名，不广播！
     const txObj = {
-      bodyBytes: toBase64(signDoc.bodyBytes),    // 本地 toBase64，不要用 PaxiCosmJS.Encoder（不存在）
+      bodyBytes: toBase64(signDoc.bodyBytes),
       authInfoBytes: toBase64(signDoc.authInfoBytes),
       chainId,
       accountNumber: String(signDoc.accountNumber),
@@ -332,7 +311,6 @@
       throw new Error('paxihub 签名失败：' + JSON.stringify(result));
     }
 
-    // ---- 组装 TxRaw 并广播（指南 §3.4 后半段，旧代码完全缺失这一步）----
     const sigBytes = Uint8Array.from(atob(result.success), (c) => c.charCodeAt(0));
     const txRaw = PaxiCosmJS.TxRaw.fromPartial({
       bodyBytes: signDoc.bodyBytes,
@@ -362,14 +340,10 @@
       throw new Error(txr.raw_log || '广播失败：code=' + txr.code);
     }
 
-    // BROADCAST_MODE_SYNC 只等 mempool 准入，不等合约执行；必须进一步用 waitForTx
-    // 轮询链上最终结果，否则合约里的 Err(TkccNotConfigured) / Err(AlreadyJoined) /
-    // Err(Expired) 会被当成成功，UI 显示"参与成功"但链上实际失败。
+    // SYNC 只等 mempool 准入，不等合约执行 → 必须 waitForTx 二次确认，
+    // 否则合约报错会被误判成成功
     const txhash = txr.txhash;
     if (!txhash) {
-      // 拿不到 txhash 就无法二次确认，合约到底执行成功还是失败是未知的。
-      // 旧实现在这里返回 code:0，UI 会显示"参与成功"，但链上可能是失败的 ——
-      // 宁可报错让用户去区块浏览器核对，也不要给出假成功。
       throw new Error('广播未返回 txhash，无法确认链上执行结果，请稍后刷新列表核对。');
     }
     const confirmed = await waitForTx(txhash);

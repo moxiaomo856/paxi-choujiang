@@ -1,26 +1,35 @@
 /* =====================================================================
- * app.js —— 抽奖前端 UI 逻辑
+ * app.js —— 抽奖前端 UI 逻辑（4 tab：奖池 / 创建 / 我的 / 管理）
  * ===================================================================== */
 (function () {
   const C = window.CJ_CONFIG;
   const K = window.CJChain;
   const S = window.CJSession;
   const L = window.CJLottery;
+  // i18n.js 万一没加载（网络/缓存问题），退化成"原文直出"，绝不能因此让整个应用起不来
+  const T = (window.CJ_I18N && window.CJ_I18N.t) || ((k) => k);
+  const LANG = () => (window.CJ_I18N && window.CJ_I18N.getLang()) || 'zh';
 
   const $ = (id) => document.getElementById(id);
   const log = (msg) => {
     const el = $('log');
-    el.textContent = `[${new Date().toLocaleTimeString('zh-CN')}] ${msg}\n` + el.textContent;
+    el.textContent = `[${new Date().toLocaleTimeString(LANG() === 'zh' ? 'zh-CN' : 'en-US')}] ${msg}\n` + el.textContent;
   };
-  const _bannerKind = { _k: 'info' };  // 当前 banner 类型，防止轮询 refresh 冲掉用户错误提示
+  const UNCLAIMED_MAX = 30;   // 已开奖池的"未领奖"查询上限（轮询性能）
+
+  const escapeHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // ---------- Banner ----------
+  const _bannerKind = { _k: 'info' };
   const banner = (msg, kind) => {
     const el = $('banner');
-    el.onclick = null;      // 清掉上一次挂的 onclick（深链分支挂的 paxi:// 跳转）
-    el.style.cursor = '';   // 恢复默认光标
+    // 清掉上一次挂的 onclick / cursor（深链分支会把 banner 变成可点跳 paxi://，
+    // 不清的话之后任何错误提示点一下都会误跳）
+    el.onclick = null;
+    el.style.cursor = '';
     if (!msg) {
-      // O3：banner('') 只清 info 类（轮询用来消除"未配置"提示），
-      // 不清 err / warn（用户操作失败的错误提示不应被轮询静默）。
-      if (_bannerKind._k !== 'info') return;
+      if (_bannerKind._k !== 'info') return;   // 只清 info，错误提示不被轮询冲掉
       el.hidden = true;
       return;
     }
@@ -29,14 +38,7 @@
     el.className = 'banner ' + _bannerKind._k;
     el.textContent = msg;
   };
-  const escapeHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  /**
-   * 统一错误处理。
-   * P1-1：需要会话签名却没开启时（err.needSession），顺便把「开启无感」按钮
-   * 显示并高亮 —— 只给一句文字提示，用户还得自己在页面上找按钮，体验差。
-   */
   function fail(e, prefix) {
     const msg = (e && e.message) ? e.message : String(e);
     if (e && e.needSession) {
@@ -44,13 +46,56 @@
       b.hidden = false;
       b.classList.add('primary');
       b.classList.remove('ghost');
-      b.textContent = '开启无感';
+      b.textContent = T('wallet.openSession');
+      refreshSessionCard();
     }
     log((prefix ? prefix + '：' : '') + msg);
     banner(msg, 'err');
   }
 
-  // ---------- 通用复制（手机端刚需：长按选择长文本体验差）----------
+  // ---------- 手机端防双击 ----------
+  // 触屏连点会发出两笔交易（双倍扣费）。全局锁：有交易在途时拦截新操作。
+  let txBusy = false;
+
+  /** 等交易库就位（cosmjs 2.6MB 是后台异步加载的） */
+  function waitCosmjs(ms = 20000) {
+    return new Promise((resolve) => {
+      if (typeof PaxiCosmJS !== 'undefined') return resolve(true);
+      const t0 = Date.now();
+      const iv = setInterval(() => {
+        if (typeof PaxiCosmJS !== 'undefined') { clearInterval(iv); resolve(true); }
+        else if (Date.now() - t0 > ms) { clearInterval(iv); resolve(false); }
+      }, 200);
+    });
+  }
+
+  async function guardBusy(btn, fn) {
+    if (txBusy) {
+      banner(T('common.busy'), 'warn');
+      return;
+    }
+    if (typeof PaxiCosmJS === 'undefined') {
+      banner(T('common.libLoading'), 'info');
+      const ok = await waitCosmjs();
+      if (!ok) {
+        banner(T('common.libFail'), 'err');
+        return;
+      }
+      banner('');
+    }
+    txBusy = true;
+    // 存 innerHTML：领奖按钮是图标+文字，只还原 textContent 会丢掉图标
+    const origHtml = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.textContent = T('common.processing'); }
+    try {
+      await fn();
+    } finally {
+      txBusy = false;
+      if (btn) { btn.disabled = false; btn.innerHTML = origHtml; }
+    }
+  }
+
+  // ---------- 复制 ----------
   async function copyText(text, label) {
     const s = String(text == null ? '' : text);
     if (!s) return;
@@ -58,30 +103,25 @@
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(s);
       } else {
-        // 手机 WebView / 非 https 兜底
         const ta = document.createElement('textarea');
         ta.value = s;
         ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
         document.body.appendChild(ta);
-        ta.focus();
-        ta.select();
+        ta.focus(); ta.select();
         document.execCommand('copy');
         document.body.removeChild(ta);
       }
-      log('已复制' + (label ? ' ' + label : '') + '：' + s.slice(0, 16) + (s.length > 16 ? '…' : ''));
+      log(T('common.copyOk', { label: label ? ' ' + label : '' }));
+      banner(T('common.copyOk', { label: label ? ' ' + label : '' }), 'info');
     } catch (e) {
-      banner('复制失败，请长按手动选择', 'warn');
+      banner(T('common.copyFail'), 'warn');
     }
   }
-  // 生成可复制的 HTML 片段（渲染时套用即可）
   function copyable(text, label, display) {
     const t = String(text == null ? '' : text);
     const d = display == null ? t : String(display);
-    return `<span class="copyable" title="点击复制 ${escapeHtml(label || '')}" `
-      + `data-copy="${escapeHtml(t)}" data-copy-label="${escapeHtml(label || '')}">`
-      + `${escapeHtml(d)}</span>`;
+    return `<span class="copyable" data-copy="${escapeHtml(t)}" data-copy-label="${escapeHtml(label || '')}">${escapeHtml(d)}</span>`;
   }
-  // 全局事件委托：任何 [data-copy] 元素被点击都触发复制
   document.addEventListener('click', (e) => {
     const el = e.target.closest && e.target.closest('[data-copy]');
     if (!el) return;
@@ -89,53 +129,108 @@
     copyText(el.dataset.copy, el.dataset.copyLabel || '');
   });
 
+  // ---------- 全局状态 ----------
   let tkccInfo = { token: '', decimals: C.tkccDecimals, configured: false };
-  let view = [];
   let isAdmin = false;
-  let refreshing = false;
   let adminFromChain = false;
   let chainAdmins = [];
   let chainThreshold = 0;
-  let templates = [];
-  // 「确认强制揭示」状态（模板 id → 字符串 key）。存内存而非按钮 dataset：
-  // refreshAll 会重建 tplList 的 DOM，dataset 会随轮询丢失。
-  const revealForced = new Set();
-  // 全部模板的元信息（id → PoolTemplate），供 renderList 判断官方池
-  // 是否有承诺（无承诺模板的满员池只能等过期退款，提示要区分）。
-  let tplMeta = {};
+  let currentTab = 'pools';
+  let allPools = [];
+  let selectedTier = Number(C.defaultTier || 0);
+  let refreshing = false;
+  let sharedPoolId = null;      // 从分享链接解析出的目标奖池
+  let poolsLoaded = false;      // 首次加载用骨架屏
+  // 内部余额（raw，字符串），用于"余额不足"预检
+  let balPaxiRaw = '0';
+  let balTkccRaw = '0';
+  let myJoinedIds = new Set();      // 我参与过的池 id（列表打"已参与"标）
+  let pendingClaims = [];           // 待领奖（奖池页顶部展示）
+  // 奖池视图缓存（id → view）：奖池页与我的页都会写入，
+  // 按钮操作从这里取，避免在我的页点到奖池页列表里没有的池（如已退款池）
+  let poolCache = new Map();
 
-  // ---------- 钱包 / 会话 ----------
+  // =====================================================================
+  // Tab 切换
+  // =====================================================================
+  function switchTab(name) {
+    currentTab = name;
+    document.querySelectorAll('.page').forEach((el) => {
+      el.hidden = el.id !== 'page-' + name;
+    });
+    document.querySelectorAll('.tabbar .tab').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tab === name);
+    });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (name === 'me')    refreshMyPage().catch(() => {});
+    if (name === 'admin') refreshAdminPage().catch(() => {});
+    if (name === 'pools') refreshPools().catch(() => {});
+    if (name === 'create') updateCostBox();
+  }
+  document.querySelectorAll('.tabbar .tab').forEach((b) => {
+    b.onclick = () => switchTab(b.dataset.tab);
+  });
+
+  // =====================================================================
+  // 无感引导卡片
+  // =====================================================================
+  function refreshSessionCard() {
+    const card = $('sessionCard');
+    if (!card) return;
+    if (!K.wallet.address) {
+      card.hidden = false;
+      $('sessionCardTitle').textContent = T('sessCard.titleConnect');
+      $('sessionCardDesc').textContent  = T('sessCard.descConnect');
+      $('btnSessionCard').textContent   = T('sessCard.btnConnect');
+      $('btnSessionCard').onclick       = () => guardBusy($('btnSessionCard'), () => onConnect());
+      return;
+    }
+    if (S.state.enabled) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    $('sessionCardTitle').textContent = T('sessCard.titleEnable');
+    $('sessionCardDesc').textContent  = T('sessCard.descEnable');
+    $('btnSessionCard').textContent   = T('sessCard.btnEnable');
+    $('btnSessionCard').onclick       = () => guardBusy($('btnSessionCard'), () => onSession());
+  }
+
+  // =====================================================================
+  // 钱包 / 会话
+  // =====================================================================
   async function onConnect() {
     const addr = await K.connect();
-    // 成功连接后清掉此前遗留的错误/警告横幅。典型场景：钱包还没注入完成时
-    // 手动点过"连接钱包"，报了"未检测到 PaxiHub 钱包"（err 类）；随后注入
-    // 完成、连接成功，但 banner('') 按设计只清 info 类，err 会一直挂着误导用户。
-    _bannerKind._k = 'info';
-    banner('');
     $('addr').innerHTML = copyable(addr, '地址', addr.slice(0, 10) + '…' + addr.slice(-6));
     $('btnSession').hidden = false;
-    // 依赖 CDN 的加密库自检：连上就先确认，避免"提交时才失败、分不清是 CDN 还是合约"
+    // 清掉连接前遗留的错误横幅（注入完成前点过连接会留下误导性报错）
+    _bannerKind._k = 'info';
+    banner('');
+
     if (!(window.CJHash && (await window.CJHash.ready()))) {
-      banner('加密库（@noble/secp256k1 / @noble/hashes / bech32）未加载成功：无感会话与"承诺哈希"将不可用。请确认网络能访问 CDN 后刷新页面。', 'warn');
+      banner(T('msg.cryptoLibFail'), 'warn');
     }
     if (S.restore()) {
       await S.syncNonce();
       if (S.state.enabled) {
         $('sessTag').hidden = false;
-        $('btnSession').textContent = '关闭无感';
+        $('btnSession').textContent = T('wallet.closeSession');
       } else {
         $('sessTag').hidden = true;
-        $('btnSession').textContent = '开启无感';
-        log('无感会话已失效，请重新开启');
+        $('btnSession').textContent = T('wallet.openSession');
+        log(T('msg.sessionExpired'));
       }
     }
     await detectAdmin();
-    await refreshAll();
-    log('已连接 ' + addr);
+    refreshSessionCard();
+    await refreshTkcc(true).catch(() => {});
+    await refreshBalance().catch(() => {});
+    await refreshPools().catch(() => {});
+    log(T('msg.connected', { addr }));
+    autoEnableTkcc().catch(() => {});
   }
 
-  /** 是否为管理员（决定是否显示管理面板）
-   *  优先用链上 {"admins":{}}；合约未部署 / 查询失败时回落到 config.js 的 admins 白名单 */
   async function detectAdmin() {
     try {
       const res = await K.queryContract({ admins: {} });
@@ -147,157 +242,87 @@
       isAdmin = (C.admins || []).includes(K.wallet.address);
       adminFromChain = false;
     }
-    $('adminPanel').hidden = !isAdmin;
-    // P3-3：管理员面板的渲染统一交给紧接着的 refreshAll()（它已含 renderAdmins /
-    // refreshContractInfo / refreshTemplates），此处不再重复，避免 renderAdmins 连调两次。
+    $('tabAdmin').hidden = !isAdmin;
   }
 
-  /** 展示管理员白名单（链上优先） */
   function renderAdmins() {
     const list = adminFromChain && chainAdmins.length ? chainAdmins : (C.admins || []);
-    $('adminsStatus').textContent =
-      `管理员（${adminFromChain ? '链上' : 'config.js 兜底'}，阈值 ${chainThreshold || C.multisigThreshold}）：`
-      + (list.length ? list.join('、') : '—');
-  }
-
-  /** 合约级配置（运营金库 / 暂停状态） */
-  async function refreshContractInfo() {
-    try {
-      const cfg = await L.contractConfig();
-      const t = cfg.treasury || '';
-      const match = t === C.treasury;
-      $('treasuryStatus').textContent =
-        `运营金库（链上）：${t || '—'}`
-        + (t && !match ? ` · config.js 里是 ${C.treasury}（可点下方写入）` : '')
-        + (cfg.paused ? ' · ⚠️ 合约已暂停' : '');
-      $('btnSetTreasury').textContent = match ? '运营金库一致（可重写）' : '写入运营金库';
-      $('btnSetTreasury').classList.toggle('ghost', match);
-    } catch (e) {
-      $('treasuryStatus').textContent = `运营金库（config.js，合约未就绪）：${C.treasury}`;
-    }
-  }
-
-  /** 管理员：把 config.js 的运营金库写进合约 */
-  async function onSetTreasury() {
-    try {
-      if (!C.treasury) return banner('config.js 里没有 treasury 地址', 'err');
-      await L.setTreasury(C.treasury);
-      log('已写入运营金库：' + C.treasury);
-      await refreshContractInfo();
-    } catch (e) {
-      log('写入运营金库失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
-    }
+    const sep = LANG() === 'zh' ? '、' : ', ';
+    const listStr = list.length ? list.join(sep) : '—';
+    $('adminsStatus').textContent = T('msg.adminsLine', {
+      src: adminFromChain ? T('msg.statusOnchain') : T('msg.statusFallback'),
+      t: chainThreshold || C.multisigThreshold,
+      list: listStr,
+    });
   }
 
   async function onSession() {
     if (S.state.enabled) {
       S.clear();
       $('sessTag').hidden = true;
-      $('btnSession').textContent = '开启无感';
-      log('已关闭无感');
+      $('btnSession').textContent = T('wallet.openSession');
+      log(T('msg.sessionClosed'));
+      refreshSessionCard();
       return;
     }
     const a = await S.enable();
     $('sessTag').hidden = false;
-    $('btnSession').textContent = '关闭无感';
-    log('无感已开启：' + a);
-    banner(`无感已开启。已随注册给会话账户预存 ${(Number(C.sessionGasFund || 300000) / 1e6).toFixed(2)} PAXI gas：之后「参与 / 建池」由会话私钥本地签名广播，不再弹钱包；充值 / 提现 / 领奖仍需钱包确认。gas 耗尽后参与会自动改走钱包签名，重新开启无感即可再充。`, 'info');
+    $('btnSession').textContent = T('wallet.closeSession');
+    log(T('msg.sessionOpened', { addr: a }));
+    banner(T('msg.sessionOpenedBanner', { h: C.sessionTtlHours || 24, g: (Number(C.sessionGasFund || 300000) / 1e6).toFixed(2) }), 'info');
+    refreshSessionCard();
+    if (currentTab === 'me') refreshSessionStatus().catch(() => {});
   }
 
-  // ---------- 数据 ----------
-  /** 刷新 TKCC 元信息；quiet=true 时不改顶部横幅（用于未连接钱包的初始渲染） */
+  // =====================================================================
+  // TKCC / 余额
+  // =====================================================================
   async function refreshTkcc(quiet) {
     try {
       tkccInfo = await L.resolveTkcc();
       $('balTkccLabel').textContent = tkccInfo.symbol || 'TKCC';
       $('tkccStatus').textContent = tkccInfo.token
-        ? `TKCC 合约：${tkccInfo.token}（${tkccInfo.symbol}，decimals ${tkccInfo.decimals}）· 合约内已启用：${tkccInfo.configured ? '是' : '否'}`
-        : 'TKCC 合约：config.js 未配置';
+        ? T('msg.tkccStatusLine', {
+            addr: tkccInfo.token,
+            symbol: tkccInfo.symbol,
+            d: tkccInfo.decimals,
+            on: tkccInfo.configured ? T('common.yes') : T('common.no'),
+          })
+        : T('msg.tkccStatusEmpty');
 
-      // 当前销毁配置回填（管理员面板）
       if (tkccInfo.burnMode) $('burnMode').value = tkccInfo.burnMode;
       if (tkccInfo.burnAddress && !$('burnAddr').value) $('burnAddr').value = tkccInfo.burnAddress;
 
-      // 管理员：合约还没写入 TKCC 时高亮按钮
       const btn = $('btnSetTkcc');
-      btn.textContent = tkccInfo.configured ? '重新写入 TKCC 地址' : '启用 TKCC（写入合约）';
+      btn.textContent = tkccInfo.configured ? T('admin.rewriteTkcc') : T('admin.enableTkcc');
       btn.classList.toggle('ghost', tkccInfo.configured);
       btn.classList.toggle('primary', !tkccInfo.configured);
 
       if (quiet) return;
-      if (tkccInfo.configured) {
-        banner('');
-      } else if (isAdmin && tkccInfo.token) {
-        banner('本合约尚未启用 TKCC。你是管理员，点上方「启用 TKCC」写入地址即可启用全部 TKCC 功能。', 'warn');
-      } else {
-        banner('TKCC 尚未配置：创建 / 参与抽奖会返回 TkccNotConfigured。管理员 SetTkccToken 后自动启用。', 'warn');
-      }
+      if (tkccInfo.configured) banner('');
+      else if (isAdmin && tkccInfo.token) banner(T('msg.tkccNotConfiguredAdmin'), 'warn');
+      else banner(T('msg.tkccNotConfigured'), 'warn');
     } catch (e) {
       if (!quiet) banner(e.message || String(e), 'err');
     }
   }
 
-  /** 管理员：把 config.js 里的 TKCC 地址写进合约 */
-  async function onSetTkcc() {
-    try {
-      // 要"写入合约"的地址一律取 config.js；`tkccInfo.token` 可能是**链上已配置**的值，
-      // 两者来源不同，不能拿它来判断 config.js 是否为空（否则会给出误导性提示）。
-      const target = C.tkccToken;
-      if (!target) {
-        return banner('config.js 里未配置 tkccToken，无法写入合约'
-          + (tkccInfo.token ? `（链上当前是 ${tkccInfo.token}）` : ''), 'err');
-      }
-      await L.setTkccToken(target);
-      log('已写入 TKCC 地址：' + target);
-      await refreshAll();
-    } catch (e) {
-      log('启用 TKCC 失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
-    }
-  }
-
-  /** 管理员：设置 TKCC 销毁方式（burn / black_hole / skip） */
-  async function onSetBurnMode() {
-    const mode = $('burnMode').value;
-    try {
-      await L.setTkccBurnMode(mode);
-      log('已设置销毁方式：' + mode);
-      await refreshAll();
-    } catch (e) {
-      log('设置销毁方式失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
-    }
-  }
-
-  /** 管理员：设置 TKCC 销毁黑洞地址 */
-  async function onSetBurn() {
-    const address = $('burnAddr').value.trim();
-    if (!address) return banner('请填写销毁黑洞地址', 'warn');
-    try {
-      await L.setTkccBurnAddress(address);
-      log('已设置销毁黑洞：' + address);
-      await refreshAll();
-    } catch (e) {
-      log('设置黑洞失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
-    }
-  }
-
   async function refreshBalance() {
     if (!K.wallet.address) return;
-    // P2-2 修复：不再解析 Balances 列表猜 native key（旧代码假设 key 是空字符串，
-    // 若 paxi_common::native_key() 非空串则 PAXI 余额恒显示 0）。
-    // PAXI 直接用 token=null 查原生余额；TKCC 用显式 token 地址查，与 key 格式无关。
+    // 不解析 Balances 列表猜 native key（旧代码假设空字符串，实际可能不是），
+    // 改成各查一次：PAXI 用 token=null，TKCC 用显式地址。
     try {
       const p = await L.balance(K.wallet.address, null);
-      $('balPaxi').textContent = L.fmtPaxi(p.balance);
+      balPaxiRaw = String(p.balance || '0');
+      $('balPaxi').textContent = L.fmtPaxi(balPaxiRaw);
     } catch (e) { /* 忽略 */ }
     try {
       if (tkccInfo.token) {
         const t = await L.balance(K.wallet.address, tkccInfo.token);
-        $('balTkcc').textContent = L.fmtTkcc(t.balance, tkccInfo.decimals);
+        balTkccRaw = String(t.balance || '0');
+        $('balTkcc').textContent = L.fmtTkcc(balTkccRaw, tkccInfo.decimals);
       } else {
+        balTkccRaw = '0';
         $('balTkcc').textContent = '—';
       }
     } catch (e) { /* 忽略 */ }
@@ -306,501 +331,737 @@
       const p = bank.find((b) => b.denom === C.coinMinimalDenom);
       $('bankPaxi').textContent = L.fmtPaxi(p ? p.amount : '0');
     } catch (e) { /* 忽略 */ }
+    updateCostBox();
   }
 
-  async function refreshList() {
-    const status = $('fStatus').value || null;
-    const res = await L.lotteries(status, 30);
-    view = (res.lotteries || [])
-      // 官方池「进行中」的（open/full）由上方「官方奖池」区块展示；
-      // 但满员（full）的官方池也要落到本列表：它正等待平台揭示 + 开奖，
-      // 需要在这里显示"等待揭示"提示。已开奖的官方池同样保留在列表里，
-      // 让用户看到历史中奖名单与开奖 seed。
-      .filter((l) => !l.is_template_pool || l.status === 'drawn' || l.status === 'full')
-      .map((l) => L.toView(l, tkccInfo.decimals));
-    renderList();
+  // =====================================================================
+  // 奖池：刷新 + 渲染
+  // =====================================================================
+  function showSkeleton() {
+    $('list').innerHTML = [0, 1, 2].map(() =>
+      '<div class="skeleton"><i class="w40"></i><i class="w70"></i><i class="w40"></i></div>'
+    ).join('');
   }
 
-  function renderList() {
-    const el = $('list');
-    if (!view.length) { el.innerHTML = '<p class="hint">暂无抽奖</p>'; return; }
-    el.innerHTML = view.map((v) => {
-      const pct = v.maxPeople ? Math.min(100, Math.round((v.count / v.maxPeople) * 100)) : 0;
-      const isCreator = K.wallet.address && v.creator === K.wallet.address;
-      const expired = Date.now() > v.expiresAt;
-      const acts = [];
-      // P1-2：建池者不能参与自己的池（合约已直接拒绝）。这里不再给按钮，
-      // 改为一行说明，避免用户点了才吃到 CreatorCannotJoin 报错。
-      // 模板池的 creator 是合约自身地址，永远不会命中 isCreator。
-      if (v.status === 'open' && !expired && !isCreator)
-        acts.push(`<button class="btn sm" data-act="join" data-id="${v.id}">参与</button>`);
-      // simple 版：只有满员才能开奖（合约无 min_people 分支），过期未满员只能退款。
-      const canDraw = v.status === 'full' && !v.needsReveal;
-      if (canDraw)
-        acts.push(`<button class="btn sm primary" data-act="draw" data-id="${v.id}">开奖</button>`);
-      if (v.status === 'drawn') acts.push(`<button class="btn sm primary" data-act="claim" data-id="${v.id}">领取</button>`);
-      if (expired && v.status !== 'drawn' && v.status !== 'refunded')
-        acts.push(`<button class="btn sm ghost" data-act="refund" data-id="${v.id}">退款</button>`);
-      if (v.needsReveal && isCreator)
-        acts.push(`<button class="btn sm ghost" data-act="reveal" data-id="${v.id}">揭示秘密</button>`);
-      // 提示类内容不放 acts（那是按钮容器），单独渲染在按钮区下面；
-      // 用 warn 色提示，避免与其他 muted 的 .hint 混为一谈
-      const revealHint = (v.needsReveal && v.status !== 'drawn' && v.status !== 'refunded')
-        ? '<div class="hint" style="color:var(--warn)">⚠️ 创建者未揭示秘密，暂不能开奖；到期后可退款</div>'
-        : '';
-      // 模板池专属提示：官方池没有"创建者"，揭示走"管理员 → 模板管理 →
-      // 揭示下一个秘密"（存 TEMPLATE_SECRETS 查表，不用池子的 revealed 字段）。
-      // needsReveal 对模板池恒为 false，所以这里用"full 但还没开奖"判断。
-      // 模板池专属提示：按模板是否有承诺区分。
-      // 无承诺模板的池子**永远无法开奖**（合约会报 TemplateCommitRequired），
-      // 只能等过期退款 —— 文案必须如实，不能误导管理员去点一个点不动的揭示。
-      // 模板是否有承诺：三态 —— true/false/null。
-      // null = 模板元信息还没加载完（tplMeta 为空），此时**不能**默认当成
-      // "有承诺"给"等待揭示"提示，也不能误报"无承诺只能退款"，给加载中提示。
-      const tplHasCommit = v.templateId != null && tplMeta[v.templateId]
-        ? !!tplMeta[v.templateId].has_commit : null;
-      const tplRevealHint = (v.isTemplatePool && v.status === 'full' && !v.seed)
-        ? (tplHasCommit === false
-          ? `<div class="hint" style="color:var(--warn)">⚠️ 官方池（模板 ${v.templateId}）创建时未配置随机承诺，无法开奖；满员后只能等待过期退款。</div>`
-          : tplHasCommit === true
-            ? `<div class="hint">官方池（模板 ${v.templateId}）已满员，等待平台在「管理员 → 模板管理」揭示秘密后即可开奖。</div>`
-            : `<div class="hint">官方池（模板 ${v.templateId}）已满员，正在加载模板信息…</div>`)
-        : '';
-      const creatorHint = (isCreator && v.status === 'open' && !expired)
-        ? '<div class="hint">你建的池：建池者不能参与自己的池（已拿建池者分成）。</div>'
-        : '';
-
-      const fmtWin = (list) => (list || [])
-        .map((a) => copyable(a, '地址', a.slice(0, 8) + '…' + a.slice(-4)))
-        .join('、');
-      const win = v.winners
-        ? `<div class="win">一等奖：${fmtWin(v.winners.first)}<br/>二等奖：${fmtWin(v.winners.second)}</div>`
-        : '';
-
-      const poolTag = v.isTemplatePool
-        ? `<span class="st platform">官方池 · 模板 ${v.templateId}</span>`
-        : `<span class="st player">玩家建池</span>`;
-
-      return `<div class="item">
-        <div class="item-top">
-          <span class="id">${copyable(String(v.id), '抽奖 ID', '#' + v.id)}</span>
-          <span class="st ${v.status}">${v.statusText}</span>
-          ${poolTag}
-          ${isCreator ? '<span class="st mine">我建的</span>' : ''}
-        </div>
-        <div class="meta">参与费 ${v.joinPaxi} PAXI + ${v.joinTkcc} TKCC · 奖池 ${v.poolPaxi} PAXI / ${v.poolTkcc} TKCC</div>
-        <div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="meta">${v.count} / ${v.maxPeople} 人 · 截止 ${v.expiresText}${v.randomSource ? ' · 随机源 ' + v.randomSource : ''}</div>
-        ${win}
-        <div class="acts">${acts.join('')}</div>
-        ${revealHint}
-        ${tplRevealHint}
-        ${creatorHint}
-      </div>`;
-    }).join('');
-
-    el.querySelectorAll('button[data-act]').forEach((b) => {
-      b.onclick = () => guardBusy(b, () => onAction(b.dataset.act, Number(b.dataset.id)));
-    });
-  }
-
-  // ---------- 官方模板池（B2）----------
-  async function refreshTemplatePools() {
-    if (!C.showTemplatePools) { $('templateSection').hidden = true; return; }
-    const res = await L.activePoolOfTemplates().catch(() => ({ entries: [] }));
-    const entries = res.entries || [];
-    const el = $('templatePools');
-    el.innerHTML = entries.length
-      ? entries.map((e) => {
-          const pct = e.max_people ? Math.min(100, Math.round((e.participant_count / e.max_people) * 100)) : 0;
-          const full = e.participant_count >= e.max_people;
-          const feeTkcc = L.fmtTkcc(L.tkccToRaw(e.join_tkcc, tkccInfo.decimals), tkccInfo.decimals);
-          return `<div class="item">
-            <div class="item-top">
-              <span class="id">${escapeHtml(e.template_name)}</span>
-              <span class="st ${full ? 'full' : 'open'}">${full ? '已满，将开新池' : '报名中'}</span>
-            </div>
-            <div class="meta">参与费 ${L.fmtPaxi(e.join_paxi)} PAXI + ${feeTkcc} TKCC</div>
-            <div class="meta">${e.participant_count} / ${e.max_people} 人</div>
-            <div class="meta" style="opacity:.6;font-size:11px">🎲 随机源：平台托管秘密 + 参与者加入时间 + 区块熵（开奖前平台揭示，任何人可复算验证）</div>
-            <div class="bar"><i style="width:${pct}%"></i></div>
-            <div class="acts">
-              <button class="btn sm primary" data-tpl="${e.template_id}">${full ? '开新池并参与' : '参与'}</button>
-            </div>
-          </div>`;
-        }).join('')
-      : '<p class="hint">暂无活跃模板，请联系管理员</p>';
-
-    el.querySelectorAll('[data-tpl]').forEach((b) => {
-      b.onclick = () => guardBusy(b, () => onActivate(Number(b.dataset.tpl)));
-    });
-  }
-
-  async function onActivate(tid) {
-    try {
-      // P2-4 修复：签名金额改用**链上返回值**（activePoolOfTemplates 的 join_paxi /
-      // join_tkcc 来自合约 tier_spec），不再用 config.js 的本地 tiers 表 ——
-      // 合约按池子快照扣费，本地表与合约不同步时会导致签名验证失败且报错不可读。
-      // activePoolOfTemplates 覆盖全部活跃模板（无活跃池也返回条目），故几乎总能命中；
-      // 查询失败才回落本地表（与旧逻辑一致）。
-      const res = await L.activePoolOfTemplates().catch(() => ({ entries: [] }));
-      const entry = (res.entries || []).find((x) => x.template_id === Number(tid));
-      let joinTkccRaw, joinPaxiRaw;
-      if (entry) {
-        // ⚠️ 单位（上一轮的回归 bug，务必看清）：
-        // * entry.join_paxi 是 **upaxi raw**（合约 TierSpec.join_paxi 原样透出）
-        //   —— 直接用，绝不能再过 paxiToRaw（×10⁶ 后签名金额与合约差一百万倍，
-        //   SessionError 验签必失败 → 官方模板永远参与不进去）；
-        // * entry.join_tkcc 是 **TKCC 个数** —— 需要 ×10^decimals 换成 raw。
-        joinPaxiRaw = String(entry.join_paxi);
-        joinTkccRaw = L.tkccToRaw(entry.join_tkcc, tkccInfo.decimals);
-      } else {
-        // 兜底：config.js 的 tiers 表是**人类可读单位**，两个都要换算
-        const tpl = await L.poolTemplate(tid);
-        if (!tpl) return banner('模板不存在', 'err');
-        const t = C.tiers.find((x) => x.id === Number(tpl.tier));
-        if (!t) return banner('模板档位非法：' + tpl.tier, 'err');
-        joinTkccRaw = L.tkccToRaw(t.joinTkcc, tkccInfo.decimals);
-        joinPaxiRaw = L.paxiToRaw(t.joinPaxi);
-      }
-      await L.activateTemplate(tid, joinTkccRaw, joinPaxiRaw);
-      log(`参与模板 #${tid} 成功`);
-      await S.syncNonce();
-      await refreshAll();
-    } catch (e) {
-      fail(e, '参与失败');
-    }
-  }
-
-  async function refreshTemplates() {
-    if (!isAdmin) return;
-    const res = await L.poolTemplates().catch(() => ({ templates: [] }));
-    templates = res.templates || [];
-    $('tplList').innerHTML = templates.length
-      ? templates.map((t) => {
-          const tier = C.tiers.find((x) => x.id === Number(t.tier));
-          const spec = tier ? tier : { label: '档位' + t.tier, joinPaxi: '?', joinTkcc: '?', people: '?' };
-          const hasCommit = !!t.has_commit;
-          const hasChain = !!localStorage.getItem('cj_tpl_chain_' + t.id);
-          // 无承诺模板：合约端揭示必报 TemplateCommitRequired，按钮直接置灰，
-          // 提示如实写"满员只能退款"，不给管理员一个点不动的假入口。
-          const chainMeta = !hasCommit
-            ? '<span style="color:var(--warn)">未配置随机承诺 —— 该模板的池子满员后只能等待过期退款</span>'
-            : (hasChain ? '本机已有（可揭示）' : '⚠️ 本机没有（换设备会丢，丢失只能退款）');
-          return `<div class="item">
-          <div class="item-top"><span class="id">#${t.id} ${escapeHtml(t.name)}</span>
-            <span class="st ${t.active ? 'open' : 'refunded'}">${t.active ? '启用' : '停用'}</span></div>
-          <div class="meta">${escapeHtml(spec.label)} · 参与 ${spec.joinPaxi} PAXI + ${spec.joinTkcc} TKCC · ${spec.people} 人</div>
-          <div class="meta" style="opacity:.6;font-size:11px">随机承诺：${chainMeta}</div>
-          <div class="acts">
-            <button class="btn sm ghost" data-toggle="${t.id}" data-active="${t.active}">${t.active ? '停用' : '启用'}</button>
-            <button class="btn sm" data-reveal="${t.id}" ${hasCommit ? '' : 'disabled style="opacity:.45"'}>揭示下一个秘密</button>
-          </div>
-        </div>`;
-        }).join('')
-      : '<p class="hint">还没有模板</p>';
-    $('tplList').querySelectorAll('[data-toggle]').forEach((b) => {
-      b.onclick = () => guardBusy(b, async () => {
-        try {
-          await L.updatePoolTemplate(Number(b.dataset.toggle), b.dataset.active !== 'true');
-          log('模板状态已更新');
-          await refreshAll();
-        } catch (e) {
-          fail(e, '更新失败');
-        }
-      });
-    });
-    $('tplList').querySelectorAll('[data-reveal]').forEach((b) => {
-      b.onclick = () => guardBusy(b, async () => {
-        try {
-          // 两段式确认：第一次点击若活跃池未满员，revealTemplateSecret 抛
-          // err.needForce（可能是旧满员池在等揭示，指针已被新池覆盖）。
-          // 强制状态存**内存 Set** 而非按钮 dataset —— refreshAll 会重建
-          // tplList 的 DOM，dataset 会被丢掉，8 秒轮询间隔正好卡在两次点击
-          // 之间，用户会困惑"怎么又要点两下"。
-          const forced = revealForced.has(b.dataset.reveal);
-          await L.revealTemplateSecret(Number(b.dataset.reveal), forced);
-          revealForced.delete(b.dataset.reveal);
-          log('模板 #' + b.dataset.reveal + ' 已揭示下一个秘密');
-          await refreshAll();
-        } catch (e) {
-          if (e && e.needForce) {
-            revealForced.add(b.dataset.reveal);
-            banner(e.message, 'warn');
-            log('揭示被软拦截：' + (e.message || e));
-            // 手动改当前按钮文案让用户立即看到状态变化（DOM 重建后由
-            // revealForced.has() 在下一次渲染时还原为强制态文案）
-            b.textContent = '确认强制揭示';
-          } else {
-            fail(e, '揭示失败');
-          }
-        }
-      });
-    });
-  }
-
-  async function onCreateTemplate() {
-    try {
-      const r = await L.createPoolTemplate($('tplName').value.trim(), $('tplTier').value);
-      log('模板创建成功（#' + (r.tid || '?') + '），秘密链已存本机 localStorage，务必备份！');
-      banner('模板创建成功。随机秘密链只保存在本机，请立即备份（丢失后官方池只能退款）。', 'warn');
-      await refreshAll();
-    } catch (e) {
-      fail(e, '创建模板失败');
-    }
-  }
-
-  // ---------- 动作 ----------
-  // 手机端防双击（M-1）：触屏双击极容易误触发两次"参与/创建"，造成双倍扣费。
-  // 全局交易锁：任何一笔交易在途时，拦截所有新的交易按钮；
-  // chain.js 的 serializeTx 串行队列兜底 sequence，这里是 UX 层的第一道闸。
-  let txBusy = false;
-  async function guardBusy(btn, fn) {
-    if (txBusy) {
-      banner('上一笔交易还在处理中，请等它完成（可看下方日志）后再操作。', 'warn');
-      return;
-    }
-    txBusy = true;
-    const origText = btn ? btn.textContent : '';
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '处理中…';
-    }
-    try {
-      await fn();
-    } finally {
-      txBusy = false;
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = origText;
-      }
-    }
-  }
-
-  async function onAction(act, id) {
-    try {
-      if (act === 'join') {
-        const v = view.find((x) => x.id === id);
-        if (!v) return banner('奖池 #' + id + ' 不存在', 'err');
-        const res = await L.joinLottery(id, v.joinTkccRaw, v.joinPaxiRaw);
-        log(`参与 #${id} 成功${res.transactionHash || res.hash ? ' tx=' + (res.transactionHash || res.hash) : ''}`);
-        await S.syncNonce();
-      } else if (act === 'draw') {
-        await L.drawLottery(id);
-        log(`开奖 #${id} 成功`);
-      } else if (act === 'claim') {
-        await L.claim(id);
-        log(`领取 #${id} 成功`);
-      } else if (act === 'refund') {
-        await L.refund(id);
-        log(`退款 #${id} 成功`);
-      } else if (act === 'reveal') {
-        // 不再用 window.prompt（手机 WebView 常拦截 prompt），改页面内弹窗
-        const saved = localStorage.getItem('cj_secret_' + id);
-        $('revealLotteryId').textContent = id;
-        $('revealSecret').value = saved || '';
-        $('revealBox').hidden = false;
-        $('revealHint').textContent = saved
-          ? '秘密已自动带出；确认揭示或修改后点"确认揭示"。'
-          : '未找到自动保存的秘密，请手动输入建池时填写的随机秘密。';
-        // 预聚焦输入框让用户能立即改值
-        setTimeout(() => $('revealSecret').focus({ preventScroll: true }), 50);
-        return;  // 等用户点确认按钮
-      }
-      await refreshAll();
-    } catch (e) {
-      fail(e, '操作失败');
-    }
-  }
-
-  async function onCreate() {
-    try {
-      const secret = $('fSecret').value.trim();
-      // 承诺哈希依赖 CDN 加密库；库没加载就明确报出来，别让它伪装成"创建失败"
-      if (secret && !(window.CJHash && (await window.CJHash.ready()))) {
-        return banner('加密库未加载，无法计算承诺哈希。可把"秘密"留空直接创建，或检查网络后刷新重试。', 'err');
-      }
-      const commitHash = secret ? window.CJHash.sha256Hex(secret) : null;
-      const res = await L.createLottery({
-        tier: Number($('fTier').value),
-        commitHash,
-      });
-      log('创建成功' + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
-      // lottery_id 主路径取 res.attributes（executeViaPaxihub 已用 extractWasmAttrs
-      // 从事件提取，兼容顶层 events / logs / base64 key）；
-      // 兜底对原始 tx_response 再提取一次，与主路径同一套兼容逻辑
-      let id = res.attributes?.find((a) => a.key === 'lottery_id')?.value
-        || K.extractWasmAttrs(res.raw || {}).find((a) => a.key === 'lottery_id')?.value;
-      // #3：把 secret 存 localStorage，key = 'cj_secret_<lottery_id>'，
-      // 这样 reveal 时才能按 id 正确带出（之前用 Date.now() 当 key 对不上）
-      if (secret && id) {
-        localStorage.setItem('cj_secret_' + id, secret);
-      } else if (secret && !id) {
-        // 合约 attributes 里没拿到 lottery_id（极少数情况：LCD 日志裁剪）
-        // 这是可能丢钱的事，必须用 err 级别并写日志，不能随 warn 一闪而过
-        banner(
-          '⚠️ 创建成功，但未能自动保存"随机秘密"。请立即复制并妥善保存：' + secret
-          + '（丢失后该池到期只能退款）',
-          'err'
-        );
-        log('秘密未自动保存，请手动记录：' + secret);
-      }
-      await S.syncNonce();
-      await refreshAll();
-    } catch (e) {
-      fail(e, '创建失败');
-    }
-  }
-
-  async function onDeposit() {
-    const amount = $('depAmount').value;
-    const token = $('depToken').value;
-    if (!amount || Number(amount) <= 0) return banner('请输入数量', 'warn');
-    try {
-      if (token === 'paxi') await L.depositPaxi(amount);
-      else await L.depositTkcc(amount);
-      log(`充值 ${amount} ${token.toUpperCase()} 成功`);
-      await refreshBalance();
-    } catch (e) {
-      log('充值失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
-    }
-  }
-
-  async function onWithdraw() {
-    const amount = $('depAmount').value;
-    const token = $('depToken').value;
-    if (!amount || Number(amount) <= 0) return banner('请输入数量', 'warn');
-    try {
-      const raw = token === 'paxi'
-        ? L.paxiToRaw(amount)
-        : L.tkccToRaw(amount, tkccInfo.decimals);
-      await L.withdraw(token === 'paxi' ? null : tkccInfo.token, raw);
-      log(`提现 ${amount} ${token.toUpperCase()} 成功`);
-      await refreshBalance();
-    } catch (e) {
-      log('提现失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
-    }
-  }
-
-  async function refreshAll() {
-    if (refreshing) return;  // 防 setInterval / visibilitychange / btnRefresh 并发覆盖 session nonce
+  async function refreshPools() {
+    if (refreshing) return;
     refreshing = true;
     try {
-      await refreshTkcc();
-      await refreshBalance();
-      // 模板元信息（含 has_commit）：公开查询，普通用户也需要 ——
-      // renderList 靠它区分官方池"等待揭示"和"无承诺只能退款"。
-      await L.poolTemplates().then((r) => {
-        tplMeta = {};
-        (r.templates || []).forEach((t) => { tplMeta[t.id] = t; });
-      }).catch(() => {});
-      await refreshTemplatePools().catch((e) => log('官方奖池刷新失败：' + e.message));
-      await refreshList().catch((e) => log('列表刷新失败：' + e.message));
-      if (isAdmin) {
-        renderAdmins();
-        await refreshContractInfo().catch((e) => log('运营配置刷新失败：' + e.message));
-        await refreshTemplates().catch((e) => log('模板列表刷新失败：' + e.message));
+      if (!poolsLoaded) showSkeleton();
+      const mode = $('fStatus').value || '';
+      const status = (mode === '' || mode === 'all') ? null : mode;
+      const res = await L.lotteries(status, 100);
+      const list = (res.lotteries || []).filter((l) => !l.is_template_pool);
+
+      // 已开奖池要查"谁还没领"：轮询时逐个查会很慢，只查前 N 个
+      for (const l of list.filter((x) => x.status === 'drawn').slice(0, UNCLAIMED_MAX)) {
+        try {
+          const un = await L.unclaimed(l.id);
+          l._unclaimed = (un && un.pending) || [];
+        } catch (_) { l._unclaimed = []; }
       }
+
+      let views = list.map((l) => {
+        const v = L.toView(l, tkccInfo.decimals);
+        v._unclaimed = l._unclaimed;
+        return v;
+      });
+      views.forEach((v) => poolCache.set(v.id, v));
+      views = sortPools(views);
+
+      // 默认"进行中"：过滤掉已退款、以及已开奖且奖金已领完的池
+      if (mode !== 'all') {
+        views = views.filter((v) => {
+          if (v.status === 'refunded') return false;
+          if (v.status === 'drawn' && Array.isArray(v._unclaimed) && v._unclaimed.length === 0) return false;
+          return true;
+        });
+      }
+
+      allPools = views;
+      poolsLoaded = true;
+      // 待领奖：中奖名单就在 Lottery 对象里（无需额外查询），
+      // 再配合上面已查过的 unclaimed 即可判定"我中奖且还没领"
+      pendingClaims = views.filter((v) => {
+        if (v.status !== 'drawn' || !v.winners || !K.wallet.address) return false;
+        const me = K.wallet.address;
+        const won = (v.winners.first || []).includes(me) || (v.winners.second || []).includes(me);
+        return won && (v._unclaimed || []).includes(me);
+      });
+      renderClaimsTop();
+      renderPoolList();
+
+      if (sharedPoolId) setTimeout(() => highlightSharedPool(sharedPoolId), 300);
     } finally {
       refreshing = false;
     }
   }
 
-  // ---------- 绑定 ----------
-  $('btnConnect').onclick = () => onConnect().catch((e) => banner(e.message || String(e), 'err'));
-  $('btnSession').onclick = () => guardBusy($('btnSession'), () => onSession().catch((e) => { banner(e.message || String(e), 'err'); }));
-  $('btnCreate').onclick = () => guardBusy($('btnCreate'), onCreate);
-  $('btnCreateTpl').onclick = () => guardBusy($('btnCreateTpl'), onCreateTemplate);
-  $('btnSetTkcc').onclick = () => guardBusy($('btnSetTkcc'), onSetTkcc);
-  $('btnSetBurnMode').onclick = () => guardBusy($('btnSetBurnMode'), onSetBurnMode);
-  $('btnSetBurn').onclick = () => guardBusy($('btnSetBurn'), onSetBurn);
-  $('btnSetTreasury').onclick = () => guardBusy($('btnSetTreasury'), onSetTreasury);
-  $('btnDeposit').onclick = () => guardBusy($('btnDeposit'), onDeposit);
-  $('btnWithdraw').onclick = () => guardBusy($('btnWithdraw'), onWithdraw);
-  $('btnRefresh').onclick = () => refreshAll().catch((e) => banner(e.message || String(e), 'err'));
-  $('fStatus').onchange = () => refreshList().catch((e) => banner(e.message || String(e), 'err'));
+  /**
+   * 排序：可参与优先，其次满员待开奖，已结束垫底；
+   * 同状态内「快满员的靠前」（进度高的更容易成局），进度相同则快截止的靠前。
+   */
+  const STATUS_RANK = { open: 0, full: 1, drawn: 2, refunded: 3, cancelled: 3 };
+  function sortPools(views) {
+    return views.slice().sort((a, b) => {
+      const r = (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9);
+      if (r) return r;
+      const pa = a.maxPeople ? a.count / a.maxPeople : 0;
+      const pb = b.maxPeople ? b.count / b.maxPeople : 0;
+      if (pb !== pa) return pb - pa;
+      return (a.expiresAt || 0) - (b.expiresAt || 0);
+    });
+  }
 
-  // reveal 弹窗按钮（commit-reveal 抽奖）
-  $('btnRevealCancel').onclick = () => { $('revealBox').hidden = true; };
-  // 点遮罩区域关闭（modal 卡片内的点击不触发）
-  $('revealBox').addEventListener('click', (e) => {
-    if (e.target === $('revealBox')) $('revealBox').hidden = true;
-  });
-  $('btnRevealConfirm').onclick = () => guardBusy($('btnRevealConfirm'), async () => {
-    const secret = $('revealSecret').value.trim();
-    if (!secret) { banner('请填写随机秘密', 'warn'); return; }
-    try {
-      const nid = Number($('revealLotteryId').textContent);
-      await L.revealSecret(nid, secret);
-      log('揭示 #' + nid + ' 成功');
-      localStorage.removeItem('cj_secret_' + nid);
-      $('revealBox').hidden = true;
-      await refreshAll();
-    } catch (e) {
-      log('揭示失败：' + (e.message || e));
-      banner(e.message || String(e), 'err');
+  /** 奖池页顶部的待领奖区块：有才显示，点一下即可领 */
+  function renderClaimsTop() {
+    const box = $('claimsTop');
+    if (!box) return;
+    const n = pendingClaims.length;
+    box.hidden = n === 0;
+
+    // 我的 tab 红点：切到别的 tab（创建/管理）时也看得到还有待领
+    const dot = $('tabMeDot');
+    if (dot) dot.hidden = n === 0;
+
+    const cnt = $('claimsCount');
+    if (cnt) {
+      cnt.textContent = n > 1 ? String(n) : '';
+      cnt.hidden = n <= 1;
     }
+
+    if (n === 0) { $('claimsTopList').innerHTML = ''; return; }
+    $('claimsTopList').innerHTML = pendingClaims.map(renderPoolCard).join('');
+    bindCardActions($('claimsTopList'));
+  }
+
+  function renderPoolList() {
+    const el = $('list');
+    if (!allPools.length) {
+      el.innerHTML = '<div class="empty"><span class="big">🫥</span>' + T('pools.empty') + '</div>';
+      return;
+    }
+    el.innerHTML = allPools.map(renderPoolCard).join('');
+    bindCardActions(el);
+  }
+
+  /** 剩余时间：剩余 X 小时 Y 分 / 已截止 */
+  function leftText(expiresAt) {
+    const ms = expiresAt - Date.now();
+    if (ms <= 0) return '<span class="left">' + T('pools.expired') + '</span>';
+    const m = Math.floor(ms / 60000);
+    const d = Math.floor(m / 1440);
+    const h = Math.floor((m % 1440) / 60);
+    const mm = m % 60;
+    if (d > 0) return `<span class="left">${T('pools.leftDays', { d, h })}</span>`;
+    if (h > 0) return `<span class="left">${T('pools.leftHours', { h, m: mm })}</span>`;
+    return `<span class="left">${T('pools.leftMinutes', { m: mm })}</span>`;
+  }
+
+  function renderPoolCard(v) {
+    const pct = v.maxPeople ? Math.min(100, Math.round((v.count / v.maxPeople) * 100)) : 0;
+    const me = K.wallet.address;
+    const isCreator = !!me && v.creator === me;
+    const joined = !!me && myJoinedIds.has(v.id);
+    const expired = Date.now() > v.expiresAt;
+
+    const stateCls = v.status === 'open' ? 'is-open'
+      : v.status === 'full' ? 'is-full'
+      : v.status === 'drawn' ? 'is-drawn'
+      : v.status === 'refunded' ? 'is-refunded' : '';
+
+    const acts = [];
+    if (v.status === 'open' && !expired) {
+      // 建池者不能参与自己的池（合约已拒绝），只给分享
+      if (!isCreator) {
+        acts.push(`<button class="btn sm primary" data-act="join" data-id="${v.id}">${T('pools.join')}</button>`);
+      }
+      acts.push(`<button class="btn sm ghost share-btn" data-act="share" data-id="${v.id}">${T('common.share')}</button>`);
+    }
+    if (v.status === 'full') {
+      acts.push(`<button class="btn sm primary" data-act="draw" data-id="${v.id}">${T('pools.draw')}</button>`);
+    }
+    if (expired && v.status !== 'drawn' && v.status !== 'refunded') {
+      acts.push(`<button class="btn sm ghost" data-act="refund" data-id="${v.id}">${T('pools.refund')}</button>`);
+    }
+
+    const winHtml = renderWinBanner(v, me);
+
+    return `<div class="item ${stateCls}" data-id="${v.id}">
+      <div class="item-top">
+        <span class="id">${copyable(String(v.id), '抽奖 ID', '#' + v.id)}</span>
+        <span class="st ${v.status}">${v.statusText}</span>
+        ${isCreator ? '<span class="st mine">' + T('pools.tagMine') + '</span>' : ''}
+        ${joined ? '<span class="st joined">' + T('pools.tagJoined') + '</span>' : ''}
+      </div>
+
+      <div class="meta">${T('pools.fee')} <b>${v.joinPaxi}</b> PAXI + <b>${v.joinTkcc}</b> TKCC</div>
+      <div class="meta">${T('pools.pool')} <b>${v.poolPaxi}</b> PAXI / <b>${v.poolTkcc}</b> TKCC</div>
+
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="meta">${T('pools.people', { c: v.count, m: v.maxPeople })} · ${leftText(v.expiresAt)}${v.randomSource ? ' · ' + v.randomSource : ''}</div>
+
+      ${winHtml}
+      ${acts.length ? `<div class="acts">${acts.join('')}</div>` : ''}
+    </div>`;
+  }
+
+  function renderWinBanner(v, me) {
+    if (v.status !== 'drawn' || !me) return '';
+    const w = v.winners;
+    if (!w) return '';
+
+    const isFirst  = (w.first  || []).includes(me);
+    const isSecond = (w.second || []).includes(me);
+    if (!isFirst && !isSecond) return '';
+
+    const pending = v._unclaimed;
+    const claimed = Array.isArray(pending) && !pending.includes(me);
+
+    if (isFirst) {
+      if (claimed) {
+        return `<div class="win-banner first claimed">
+          <span class="ico">🏆</span><span>${T('pools.winFirstDone')}</span>
+        </div>`;
+      }
+      return `<div class="win-banner first">
+        <span class="ico">🎉</span><span>${T('pools.winFirst')}</span>
+      </div>
+      <button class="claim-btn" data-act="claim" data-id="${v.id}">
+        <span>💰</span><span>${T('pools.claimNow')}</span>
+      </button>`;
+    }
+    if (isSecond) {
+      if (claimed) {
+        return `<div class="win-banner second claimed">
+          <span class="ico">🥈</span><span>${T('pools.winSecondDone')}</span>
+        </div>`;
+      }
+      return `<div class="win-banner second">
+        <span class="ico">🎉</span><span>${T('pools.winSecond')}</span>
+      </div>
+      <button class="claim-btn second" data-act="claim" data-id="${v.id}">
+        <span>💰</span><span>${T('pools.claimNow')}</span>
+      </button>`;
+    }
+    return '';
+  }
+
+  function bindCardActions(root) {
+    root.querySelectorAll('button[data-act]').forEach((b) => {
+      b.onclick = () => guardBusy(b, () => onAction(b.dataset.act, Number(b.dataset.id), b));
+    });
+  }
+
+  // =====================================================================
+  // 我的页
+  // =====================================================================
+  async function refreshMyPage() {
+    if (!K.wallet.address) {
+      $('myClaims').innerHTML  = '<div class="empty">' + T('me.needConnect') + '</div>';
+      $('myCreated').innerHTML = '';
+      $('myJoined').innerHTML  = '';
+      return;
+    }
+    await refreshBalance();
+    refreshSessionStatus().catch(() => {});
+
+    const me = K.wallet.address;
+    const res = await L.lotteries(null, 200).catch(() => ({ lotteries: [] }));
+    const pools = (res.lotteries || [])
+      .filter((l) => !l.is_template_pool)
+      .map((l) => L.toView(l, tkccInfo.decimals));
+
+    const created = [];
+    const joined  = [];
+    const claims  = [];
+    myJoinedIds = new Set();
+
+    for (const v of pools) {
+      poolCache.set(v.id, v);
+      if (v.status === 'drawn') {
+        try {
+          const un = await L.unclaimed(v.id);
+          v._unclaimed = (un && un.pending) || [];
+        } catch (_) { v._unclaimed = []; }
+      }
+
+      if (v.creator === me) { created.push(v); continue; }
+
+      let isJoined = false;
+      try {
+        const ps = await L.participants(v.id);
+        isJoined = (ps.participants || []).includes(me);
+      } catch (_) {}
+
+      if (isJoined) {
+        myJoinedIds.add(v.id);
+        joined.push(v);
+        if (v.status === 'drawn' && v.winners) {
+          const isFirst  = (v.winners.first  || []).includes(me);
+          const isSecond = (v.winners.second || []).includes(me);
+          if ((isFirst || isSecond) && Array.isArray(v._unclaimed) && v._unclaimed.includes(me)) {
+            claims.push(v);
+          }
+        }
+      }
+    }
+
+    $('myClaims').innerHTML  = claims.length
+      ? claims.map(renderPoolCard).join('')
+      : '<div class="empty"><span class="big">🎈</span>' + T('me.emptyClaims') + '</div>';
+
+    $('myCreated').innerHTML = created.length
+      ? created.map(renderPoolCard).join('')
+      : '<div class="empty"><span class="big">🏗️</span>' + T('me.emptyCreated') + '</div>';
+
+    $('myJoined').innerHTML  = joined.length
+      ? joined.map(renderPoolCard).join('')
+      : '<div class="empty"><span class="big">🎯</span>' + T('me.emptyJoined') + '</div>';
+
+    bindCardActions($('myClaims'));
+    bindCardActions($('myCreated'));
+    bindCardActions($('myJoined'));
+
+    // 待领奖以"我的"页结果为准（这里扫的是全部池，更全），同步给顶部区块与红点
+    pendingClaims = claims;
+    renderClaimsTop();
+    // 奖池列表里同步"已参与"标记
+    if (currentTab === 'pools') renderPoolList();
+  }
+
+  // =====================================================================
+  // 我的页：无感会话状态 + gas 余额
+  // =====================================================================
+  async function refreshSessionStatus() {
+    const el = $('sessStateText');
+    const gasEl = $('sessGasText');
+    const btn = $('btnSessionMe');
+    if (!el) return;
+
+    if (!K.wallet.address) {
+      el.textContent = T('sessStatus.notConnected');
+      el.className = 'v off';
+      gasEl.textContent = T('sessStatus.connectHint');
+      gasEl.className = 'hint';
+      btn.textContent = T('wallet.connect');
+      btn.onclick = () => guardBusy(btn, () => onConnect());
+      return;
+    }
+
+    if (!S.state.enabled) {
+      el.textContent = T('sessStatus.off');
+      el.className = 'v off';
+      gasEl.textContent = T('sessStatus.offHint');
+      gasEl.className = 'hint';
+      btn.textContent = T('sessCard.btnEnable');
+      btn.onclick = () => guardBusy(btn, () => onSession());
+      return;
+    }
+
+    el.textContent = T('sessStatus.on');
+    el.className = 'v on';
+    btn.textContent = T('wallet.closeSession');
+    btn.onclick = () => guardBusy(btn, () => onSession());
+
+    // gas 余额：会话账户自己付 gas，用完会静默回退弹钱包，这里提前提醒
+    try {
+      const raw = await K.getBankUpaxi(S.state.sessAddr);
+      const paxi = L.fmtPaxi(raw);
+      const times = Math.floor(Number(raw || 0) / (Number(C.defaultGas || 600000) * C.gasPrice));
+      gasEl.textContent = T('sessStatus.gas', { v: paxi, n: times });
+      gasEl.className = Number(raw || 0) < 100000 ? 'hint low' : 'hint';
+      if (Number(raw || 0) < 100000) {
+        gasEl.textContent = T('sessStatus.gasLow', { v: paxi });
+      }
+    } catch (_) {
+      gasEl.textContent = T('sessStatus.gasMissing');
+      gasEl.className = 'hint low';
+    }
+  }
+
+  // =====================================================================
+  // 管理页
+  // =====================================================================
+  async function refreshAdminPage() {
+    if (!isAdmin) return;
+    renderAdmins();
+    await refreshContractInfo().catch(() => {});
+    await refreshTkcc(true).catch(() => {});
+  }
+
+  async function refreshContractInfo() {
+    try {
+      const cfg = await L.contractConfig();
+      const t = cfg.treasury || '';
+      const match = t === C.treasury;
+      $('treasuryStatus').textContent =
+        T('msg.treasuryLine', { v: t || '—' })
+        + (t && !match ? T('msg.treasuryMismatch', { v: C.treasury }) : '')
+        + (cfg.paused ? T('msg.paused') : '');
+      $('btnSetTreasury').textContent = match ? T('msg.treasurySame') : T('msg.treasuryWrite');
+      $('btnSetTreasury').classList.toggle('ghost', match);
+    } catch (e) {
+      $('treasuryStatus').textContent = T('msg.treasuryConfigFallback', { v: C.treasury });
+    }
+  }
+
+  // =====================================================================
+  // 分享
+  // =====================================================================
+  function buildShareUrl(id) {
+    const url = new URL(window.location.href);
+    url.search = '';
+    url.hash = '';
+    url.searchParams.set('pool', id);
+    return url.toString();
+  }
+
+  async function sharePool(v) {
+    if (!v) return;
+    const shareUrl = buildShareUrl(v.id);
+    const title = T('share.title', { id: v.id });
+    const text = T('share.body', {
+      id: v.id,
+      jp: v.joinPaxi, jt: v.joinTkcc,
+      pp: v.poolPaxi, pt: v.poolTkcc,
+    });
+
+    if (navigator.share) {
+      try {
+        await navigator.share({ title, text, url: shareUrl });
+        log(T('msg.shareLog', { id: v.id }));
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;   // 用户取消
+      }
+    }
+    await copyText(shareUrl, T('common.share'));
+  }
+
+  function parseSharedPool() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const id = Number(params.get('pool') || 0);
+      if (id > 0) sharedPoolId = id;
+    } catch (e) {}
+  }
+
+  function highlightSharedPool(targetId) {
+    const card = document.querySelector(`.item[data-id="${targetId}"]`);
+    if (!card) {
+      // 目标池不在当前筛选里 → 切"全部"再试一次
+      if ($('fStatus').value !== 'all') {
+        $('fStatus').value = 'all';
+        refreshPools().then(() => {
+          setTimeout(() => highlightSharedPool(targetId), 300);
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.add('highlight');
+    setTimeout(() => card.classList.remove('highlight'), 5000);
+
+    if (!K.wallet.address) {
+      banner(T('msg.shareBannerNoWallet', { id: targetId }), 'info');
+    } else {
+      banner(T('msg.shareBanner', { id: targetId }), 'info');
+    }
+
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('pool');
+      window.history.replaceState({}, '', url.toString());
+    } catch (e) {}
+    sharedPoolId = null;
+  }
+
+  // =====================================================================
+  // 动作
+  // =====================================================================
+  /** 参与前的内部余额预检：避免白扣 gas 后合约报 Insufficient */
+  function checkAfford(v) {
+    const needPaxi = BigInt(v.joinPaxiRaw || '0');
+    const needTkcc = BigInt(v.joinTkccRaw || '0');
+    const hasPaxi = BigInt(balPaxiRaw || '0');
+    const hasTkcc = BigInt(balTkccRaw || '0');
+    const shortPaxi = needPaxi > hasPaxi;
+    const shortTkcc = needTkcc > hasTkcc;
+    if (!shortPaxi && !shortTkcc) return true;
+    const need = `${v.joinPaxi} PAXI + ${v.joinTkcc} TKCC`;
+    const lack = `${shortPaxi ? L.fmtPaxi(needPaxi - hasPaxi) + ' PAXI ' : ''}`
+      + `${shortTkcc ? L.fmtTkcc(needTkcc - hasTkcc, tkccInfo.decimals) + ' TKCC' : ''}`;
+    banner(T('create.balShort', { need, lack }), 'err');
+    return false;
+  }
+
+  async function onAction(act, id, btn) {
+    try {
+      if (act === 'join') {
+        const v = poolCache.get(id) || allPools.find((x) => x.id === id);
+        if (!v) return banner(T('msg.poolNotFound'), 'err');
+        if (!checkAfford(v)) return;
+        const res = await L.joinLottery(id, v.joinTkccRaw, v.joinPaxiRaw);
+        log(T('msg.joinOk', { id }) + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
+        await S.syncNonce().catch(() => {});
+        banner(T('msg.joinOkBanner'), 'info');
+      } else if (act === 'draw') {
+        await L.drawLottery(id);
+        log(T('msg.drawOk', { id }));
+        banner(T('msg.drawOkBanner'), 'info');
+      } else if (act === 'claim') {
+        if (btn) { btn.disabled = true; btn.innerHTML = `<span>⏳</span><span>${T('pools.claiming')}</span>`; }
+        try {
+          await L.claim(id);
+          log(T('msg.claimOk', { id }));
+          banner(T('msg.claimOkBanner'), 'info');
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+      } else if (act === 'refund') {
+        await L.refund(id);
+        log(T('msg.refundLog', { id }));
+        banner(T('msg.refundOk'), 'info');
+      } else if (act === 'share') {
+        const v = poolCache.get(id) || allPools.find((x) => x.id === id);
+        await sharePool(v);
+        return;   // 分享不刷新列表
+      }
+
+      if (currentTab === 'pools') await refreshPools().catch(() => {});
+      if (currentTab === 'me')    await refreshMyPage().catch(() => {});
+      if (currentTab === 'admin') await refreshAdminPage().catch(() => {});
+      await refreshBalance().catch(() => {});
+    } catch (e) {
+      fail(e, T('err.action'));
+    }
+  }
+
+  // =====================================================================
+  // 创建
+  // =====================================================================
+  function renderTierList() {
+    const el = $('tierList');
+    el.innerHTML = C.tiers.map((t) => `
+      <div class="tier-card ${t.id === selectedTier ? 'selected' : ''}" data-tier="${t.id}">
+        <h3>${t.label}<span class="badge">${T('create.peopleFull', { n: t.people })}</span></h3>
+        <div class="meta">${T('create.perJoin')}<b>${t.joinPaxi}</b> PAXI + <b>${L.fmtWan(t.joinTkcc)}</b> TKCC</div>
+        <div class="meta">${T('create.fee')}<b>${t.createPaxi}</b> PAXI + <b>${L.fmtWan(t.createTkcc)}</b> TKCC${T('create.feeNote')}</div>
+      </div>
+    `).join('');
+    el.querySelectorAll('.tier-card').forEach((card) => {
+      card.onclick = () => {
+        selectedTier = Number(card.dataset.tier);
+        renderTierList();
+        updateCostBox();
+      };
+    });
+  }
+
+  /** 创建页费用 + 余额校验 */
+  function updateCostBox() {
+    const t = C.tiers.find((x) => x.id === Number(selectedTier)) || C.tiers[0];
+    const needPaxi = BigInt(L.paxiToRaw(t.createPaxi));
+    const needTkcc = BigInt(L.tkccToRaw(t.createTkcc, tkccInfo.decimals));
+    const hasPaxi = BigInt(balPaxiRaw || '0');
+    const hasTkcc = BigInt(balTkccRaw || '0');
+    const ok = hasPaxi >= needPaxi && hasTkcc >= needTkcc;
+
+    $('costCreate').textContent = `${t.createPaxi} PAXI + ${L.fmtWan(t.createTkcc)} TKCC`;
+    const balEl = $('costBal');
+    balEl.textContent = `${L.fmtPaxi(balPaxiRaw)} PAXI / ${L.fmtTkcc(balTkccRaw, tkccInfo.decimals)} TKCC`;
+    balEl.className = ok ? '' : 'short';
+
+    const btn = $('btnCreate');
+    btn.disabled = !ok;
+    btn.textContent = ok
+      ? T('create.btn')
+      : T('create.btnShort');
+  }
+
+  async function onCreate() {
+    try {
+      const res = await L.createLottery({ tier: selectedTier });
+      log(T('msg.createOk') + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
+      banner(T('msg.createOkBanner'), 'info');
+      await S.syncNonce().catch(() => {});
+      switchTab('me');
+    } catch (e) {
+      fail(e, T('err.create'));
+    }
+  }
+
+  // =====================================================================
+  // 充值 / 提现
+  // =====================================================================
+  async function onDeposit() {
+    const amount = $('depAmount').value;
+    const token = $('depToken').value;
+    if (!amount || Number(amount) <= 0) return banner(T('msg.inputAmount'), 'warn');
+    try {
+      if (token === 'paxi') await L.depositPaxi(amount);
+      else await L.depositTkcc(amount);
+      log(T('msg.depositOk', { a: amount, t: token.toUpperCase() }));
+      await refreshBalance();
+      banner(T('msg.depositOkBanner'), 'info');
+    } catch (e) { fail(e, T('err.deposit')); }
+  }
+
+  async function onWithdraw() {
+    const amount = $('depAmount').value;
+    const token = $('depToken').value;
+    if (!amount || Number(amount) <= 0) return banner(T('msg.inputAmount'), 'warn');
+    try {
+      const raw = token === 'paxi'
+        ? L.paxiToRaw(amount)
+        : L.tkccToRaw(amount, tkccInfo.decimals);
+      await L.withdraw(token === 'paxi' ? null : tkccInfo.token, raw);
+      log(T('msg.withdrawOk', { a: amount, t: token.toUpperCase() }));
+      await refreshBalance();
+      banner(T('msg.withdrawOkBanner'), 'info');
+    } catch (e) { fail(e, T('err.withdraw')); }
+  }
+
+  // =====================================================================
+  // 管理员动作
+  // =====================================================================
+  async function onSetTkcc() {
+    try {
+      const target = C.tkccToken;
+      if (!target) return banner(T('msg.noTkccInConfig'), 'err');
+      await L.setTkccToken(target);
+      log(T('msg.tkccWritten', { addr: target }));
+      await refreshTkcc(true);
+      banner(T('msg.tkccEnabled'), 'info');
+    } catch (e) { fail(e, T('err.enableTkcc')); }
+  }
+
+  /**
+   * 管理员自动启用 TKCC：连接后若合约还没写入 TKCC 地址，自动发起一次。
+   * 交易必须由钱包确认（无法真正静默），这里省掉的是"找按钮 + 点按钮"。
+   * 只试一次，失败则提示去管理页手动点。
+   */
+  let autoTkccTried = false;
+  async function autoEnableTkcc() {
+    if (autoTkccTried || !C.autoEnableTkcc) return;
+    if (!isAdmin || !K.wallet.address || tkccInfo.configured || !C.tkccToken) return;
+    autoTkccTried = true;
+    log(T('msg.tkccAutoStart'));
+    try {
+      await L.setTkccToken(C.tkccToken);
+      log(T('msg.tkccAutoOk', { addr: C.tkccToken }));
+      await refreshTkcc(true);
+      banner(T('msg.tkccAutoOk', { addr: C.tkccToken }), 'info');
+    } catch (e) {
+      log(T('msg.tkccAutoFail') + ' (' + (e && e.message ? e.message : e) + ')');
+      banner(T('msg.tkccAutoFail'), 'warn');
+    }
+  }
+  async function onSetTreasury() {
+    try {
+      if (!C.treasury) return banner(T('msg.noTreasuryInConfig'), 'err');
+      await L.setTreasury(C.treasury);
+      log(T('msg.treasuryWritten', { v: C.treasury }));
+      await refreshContractInfo();
+    } catch (e) { fail(e, T('err.setTreasury')); }
+  }
+  async function onSetBurnMode() {
+    try {
+      const mode = $('burnMode').value;
+      await L.setTkccBurnMode(mode);
+      log(T('msg.burnModeSet', { m: mode }));
+      await refreshTkcc(true);
+    } catch (e) { fail(e, T('err.setBurnMode')); }
+  }
+  async function onSetBurn() {
+    const address = $('burnAddr').value.trim();
+    if (!address) return banner(T('msg.burnAddrRequired'), 'warn');
+    try {
+      await L.setTkccBurnAddress(address);
+      log(T('msg.burnSet', { a: address }));
+      await refreshTkcc(true);
+    } catch (e) { fail(e, T('err.setBurn')); }
+  }
+
+  // =====================================================================
+  // 事件绑定（全部走 guardBusy，防手机连点）
+  // =====================================================================
+  $('btnConnect').onclick  = () => guardBusy($('btnConnect'), () => onConnect());
+  $('btnSession').onclick  = () => guardBusy($('btnSession'), () => onSession());
+  $('btnCreate').onclick   = () => guardBusy($('btnCreate'), () => onCreate());
+  $('btnDeposit').onclick  = () => guardBusy($('btnDeposit'), () => onDeposit());
+  $('btnWithdraw').onclick = () => guardBusy($('btnWithdraw'), () => onWithdraw());
+  $('btnRefresh').onclick  = () => refreshPools().catch((e) => banner(e.message || String(e), 'err'));
+  $('fStatus').onchange    = () => refreshPools().catch(() => {});
+  $('btnSetTkcc').onclick     = () => guardBusy($('btnSetTkcc'), () => onSetTkcc());
+  $('btnSetTreasury').onclick = () => guardBusy($('btnSetTreasury'), () => onSetTreasury());
+  $('btnSetBurnMode').onclick = () => guardBusy($('btnSetBurnMode'), () => onSetBurnMode());
+  $('btnSetBurn').onclick     = () => guardBusy($('btnSetBurn'), () => onSetBurn());
+  if (window.CJ_I18N) $('btnLang').onclick = () => window.CJ_I18N.toggle();
+
+  // 语言切换：i18n.js 已自动套用静态 data-i18n 文案，这里重渲染动态内容
+  // （卡片、横幅、倒计时、无感状态、TKCC 状态、费用框、档位卡片）
+  window.addEventListener('lang-changed', () => {
+    refreshSessionCard();
+    refreshSessionStatus().catch(() => {});
+    refreshTkcc(true).catch(() => {});
+    updateCostBox();
+    renderTierList();
+    if (currentTab === 'pools')      refreshPools().catch(() => {});
+    else if (currentTab === 'me')    refreshMyPage().catch(() => {});
+    else if (currentTab === 'admin') refreshAdminPage().catch(() => {});
   });
 
-  // 三档下拉 + 档位费用提示（simple 版唯一入口）
-  function fillTierSelect(sel, withCreateFee) {
-    sel.innerHTML = C.tiers.map((t) =>
-      `<option value="${t.id}">${t.label} · 参与 ${t.joinPaxi} PAXI + ${t.joinTkcc} TKCC`
-      + (withCreateFee ? ` · 建池 ${t.createPaxi} PAXI + ${t.createTkcc} TKCC` : '')
-      + `</option>`
-    ).join('');
-    sel.value = String(C.defaultTier || 0);
-  }
-  function tierHintText() {
-    const t = C.tiers.find((x) => x.id === Number($('fTier').value)) || C.tiers[0];
-    return `建池费 ${t.createPaxi} PAXI + ${t.createTkcc} TKCC（进奖池）；`
-      + `${t.people} 人满员自动开奖，每人参与 ${t.joinPaxi} PAXI + ${t.joinTkcc} TKCC。`;
-  }
-  fillTierSelect($('fTier'), true);
-  fillTierSelect($('tplTier'), false);
-  const _updateTierHint = () => { $('tierHint').textContent = tierHintText(); };
-  $('fTier').onchange = _updateTierHint;
-  _updateTierHint();
-
-  // 未连接钱包也先把 TKCC 地址 / 精度显示出来（只读查询，不需要钱包）
+  // =====================================================================
+  // 初始化
+  // =====================================================================
+  parseSharedPool();
+  renderTierList();
+  refreshSessionCard();
+  refreshSessionStatus().catch(() => {});
+  updateCostBox();
+  switchTab('pools');
   refreshTkcc(true).catch(() => {});
 
-  // #6：轮询 + 切回可见自动刷新（配置里 pollInterval 已声明）
+  const isWechat = /MicroMessenger/i.test(navigator.userAgent);
+  if (isWechat) {
+    setTimeout(() => {
+      banner(T('msg.wechatTip'), 'warn');
+    }, 1200);
+  }
+
+  // 轮询（仅前台 + 当前 tab）
   if (C.pollInterval > 0) {
     setInterval(() => {
-      if (document.visibilityState === 'visible' && K.wallet.address) {
-        refreshAll().catch(() => {});
-      }
+      if (document.visibilityState !== 'visible' || !K.wallet.address) return;
+      if (currentTab === 'pools') refreshPools().catch(() => {});
+      if (currentTab === 'me')    refreshMyPage().catch(() => {});
     }, C.pollInterval);
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && K.wallet.address) {
-      refreshAll().catch(() => {});
+      if (currentTab === 'pools') refreshPools().catch(() => {});
+      if (currentTab === 'me')    refreshMyPage().catch(() => {});
     }
   });
 
-  // PaxiHub 的桥接是**异步注入**的：脚本执行时 window.paxihub 往往还没挂上，
-  // 这时同步 K.hasWallet() 返回 false，会把 App 内的用户也当成"没钱包"而深链跳出去。
-  // 必须先等待注入完成，确实等不到再走深链分支。
+  // ---------- PaxiHub 桥接异步注入 + 深链 ----------
   (async () => {
     const ok = await K.waitForWallet(6000);
-    if (ok) {
-      await onConnect().catch(() => {});
-      return;
-    }
+    if (ok) { await onConnect().catch(() => {}); return; }
 
-    // 已经在 PaxiHub 里（UA 或 bridge 残留），不要再往外跳
+    // 已经在 PaxiHub 里（UA 或 bridge 残留）→ 不要再往外跳
     const inHub = /PaxiHub|paxihub/i.test(navigator.userAgent) || !!window.paxihub;
     if (inHub) {
-      banner('PaxiHub 已检测到，但钱包桥接尚未就绪。请稍等片刻后下拉刷新，或从 PaxiHub 重新打开本页。', 'warn');
+      banner(T('msg.inHubWait'), 'warn');
       return;
     }
 
     if (/Mobi/i.test(navigator.userAgent)) {
-      banner('正在唤起 PaxiHub App…若未安装将跳转下载页。', 'warn');
-      const b = document.getElementById('banner');
+      banner(T('msg.deepLinking'), 'warn');
+      const b = $('banner');
       if (b) {
         b.style.cursor = 'pointer';
         b.onclick = () => {
@@ -812,7 +1073,7 @@
       const onVis = () => { if (document.hidden) leftBrowser = true; };
       document.addEventListener('visibilitychange', onVis);
 
-      // 用隐藏 iframe 触发，避免未安装时 iOS 弹"无法打开页面"
+      // 用隐藏 iframe 触发：未安装时 iOS 不会弹"无法打开页面"
       const deep = `paxi://hub/explorer?url=${encodeURIComponent(window.location.href)}`;
       const ifr = document.createElement('iframe');
       ifr.style.cssText = 'display:none;width:0;height:0;';
@@ -828,52 +1089,7 @@
         }
       }, 2500);
     } else {
-      // 纯手机项目：桌面浏览器没有 PaxiHub（它只有手机版），
-      // 桌面端不再引导"去装钱包"，而是引导扫码把页面转移到手机 PaxiHub。
-      banner('PaxiHub 只有手机版。请用手机扫描下方二维码，在 PaxiHub App 内打开本页面。', 'warn');
-      showDesktopQr();
+      banner(T('msg.notInHub'), 'warn');
     }
   })();
-
-  /** 桌面端引导卡片：二维码 + 链接（手机端永远不会走到这里） */
-  function showDesktopQr() {
-    if (document.getElementById('qrCard')) return;
-    const app = document.querySelector('.app');
-    const card = document.createElement('div');
-    card.id = 'qrCard';
-    card.className = 'card';
-    card.innerHTML =
-      '<h2>📱 在手机 PaxiHub 中打开</h2>'
-      + '<p class="hint">用手机相机 / 浏览器扫描下方二维码（或在手机浏览器打开下面的链接），'
-      + '页面会自动唤起 PaxiHub App。</p>'
-      + '<div id="qrBox" class="qr-box">二维码加载中…</div>'
-      + '<p class="hint" style="word-break:break-all;user-select:text;-webkit-user-select:text">'
-      + escapeHtml(location.href) + '</p>';
-    const firstCard = app.querySelector('.card');
-    if (firstCard) app.insertBefore(card, firstCard);
-    else app.appendChild(card);
-
-    // qrcodejs（UMD，仅桌面引导用；手机端不加载）。
-    // 固定版本号，不用 @master —— 主分支变动会让线上二维码突然坏掉
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js';
-    s.onload = () => {
-      const box = card.querySelector('#qrBox');
-      box.textContent = '';
-      try {
-        new QRCode(box, {
-          text: location.href,
-          width: 220,
-          height: 220,
-          correctLevel: QRCode.CorrectLevel.M,
-        });
-      } catch (e) {
-        box.textContent = '二维码生成失败，请手动复制上方链接到手机打开';
-      }
-    };
-    s.onerror = () => {
-      card.querySelector('#qrBox').textContent = '二维码库加载失败，请手动复制上方链接到手机打开';
-    };
-    document.head.appendChild(s);
-  }
 })();

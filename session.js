@@ -1,31 +1,17 @@
 /* =====================================================================
- * session.js —— 无感会话密钥（抽奖专用，domain = "lottery"）
+ * session.js —— 无感会话密钥（domain = "lottery"）
  *
- * 主钱包一次性 RegisterSession 绑定会话公钥 → 之后用会话私钥本地签名，
- * 合约验签后以「主钱包」身份执行，免去逐笔弹钱包。
- *
- * 签名原文（必须与合约 paxi-common::session::build_sign_bytes 逐字一致）：
+ * 签名原文（必须与合约 build_sign_bytes 逐字一致）：
  *   "{chainId}:{contract}:{domain}:{action}:{roundId}:{amount}:{nonce}:{pubkeyHex}"
- * 哈希：裸 SHA-256（非 ADR-36），签名 hex 解码后 64/65 字节。
+ * 哈希：裸 SHA-256（非 ADR-36）。
  *
- * 【安全说明】会话私钥存 localStorage。
- *   手机端 sessionStorage 在切后台 / 锁屏时会被系统清空，导致无感会话失效；
- *   而 sessionStorage 与 localStorage 在 XSS / 同域脚本 / 浏览器扩展面前等价，
- *   唯一差异在"设备被物理接触且浏览器未锁" —— 该场景下攻击者本就能直接打开
- *   钱包 App 转走资产，无需偷会话私钥。故采用 localStorage 并明确声明安全边界。
- *
- *   缓解措施：
- *   - 会话私钥 ≠ 主钱包私钥，泄漏仅影响 daily_limit 额度内资金；
- *   - 链上可随时 RevokeSession（前端"关闭无感"按钮即触发）；
- *   - 主钱包私钥从不落地。
+ * 私钥存 localStorage（手机端 sessionStorage 切后台会被清空）。
+ * 会话私钥 ≠ 主钱包私钥，泄漏仅影响 daily_limit 额度内资金，可随时 Revoke。
  * ===================================================================== */
 (function () {
   const C = window.CJ_CONFIG;
   const K = window.CJChain;
 
-  // 手机端（Paxi 钱包 App / WKWebView / Android WebView）会在切后台、锁屏、
-  // 内存紧张时清空 sessionStorage，导致无感会话刚开就失效，用户被迫反复弹钱包。
-  // 因此改用 localStorage 持久化。安全边界见 README"无感签名"章节。
   const STORE = window.localStorage;
   const LS = { priv: 'cj_sess_priv', pub: 'cj_sess_pub', addr: 'cj_sess_addr', nonce: 'cj_sess_nonce', user: 'cj_sess_user' };
 

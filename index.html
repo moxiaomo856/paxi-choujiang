@@ -3,186 +3,232 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<!-- 手机浏览器工具栏染色（与 --bg 一致），视觉上更像原生应用 -->
+
+<!-- =====================================================================
+     全局脚本错误兜底（必须最先执行）
+     任何脚本报错/资源加载失败，此前都是"页面功能凭空消失、零提示"，
+     移动端无法排查。这里把未捕获错误 + 未处理的 Promise 拒绝直接显示出来。
+     ===================================================================== -->
+<script>
+(function () {
+  function show(text) {
+    var b = document.getElementById('banner');
+    if (b) { b.hidden = false; b.className = 'banner err'; b.textContent = text; }
+    var lg = document.getElementById('log');
+    if (lg) lg.textContent = '[' + new Date().toLocaleTimeString() + '] ' + text + '\n' + lg.textContent;
+  }
+  function later(text) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function () { show(text); });
+    } else { show(text); }
+  }
+  window.addEventListener('error', function (ev) {
+    // 资源（script/link/img）加载失败也会触发 error，但没有 message
+    var m = (ev && (ev.message || (ev.error && ev.error.message))) || '';
+    var f = (ev && ev.filename) ? String(ev.filename).split('/').pop() : '';
+    var line = ev && ev.lineno ? ':' + ev.lineno : '';
+    var text = m
+      ? '⚠️ 脚本错误：' + m + (f ? '（' + f + line + '）' : '')
+      : '⚠️ 资源加载失败：' + ((ev && ev.target && (ev.target.src || ev.target.href)) || '未知');
+    window.__lastError = text;
+    later(text);
+  }, true);
+  window.addEventListener('unhandledrejection', function (ev) {
+    var r = ev && ev.reason;
+    window.__lastError = (r && r.message) || String(r);
+  });
+})();
+</script>
 <meta name="theme-color" content="#0f1115" />
-<!-- 纯手机项目：允许"添加到主屏幕"以全屏 App 方式运行 -->
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="Paxi 抽奖" />
 <title>Paxi 抽奖</title>
+<link rel="manifest" href="./manifest.json" />
+<link rel="icon" href="./icon.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
 <div class="app">
-  <header class="top">
+
+  <!-- ========== 顶栏 ========== -->
+  <header class="topbar">
     <div class="brand">🎰 Paxi 抽奖</div>
     <div class="wallet">
-      <span id="addr" class="addr">未连接</span>
-      <button id="btnConnect" class="btn primary">连接钱包</button>
-      <button id="btnSession" class="btn" hidden>开启无感</button>
-      <span id="sessTag" class="tag" hidden>无感已开启</span>
+      <span id="addr" class="addr" data-i18n="wallet.notConnected">未连接</span>
+      <button id="btnConnect" class="btn primary sm" data-i18n="wallet.connect">连接</button>
+      <button id="btnSession" class="btn ghost sm" hidden data-i18n="wallet.openSession">开无感</button>
+      <button id="btnLang" class="btn ghost sm lang-btn">EN</button>
+      <span id="sessTag" class="tag" hidden data-i18n="wallet.sessionTag">无感</span>
     </div>
   </header>
 
   <div id="banner" class="banner" hidden></div>
 
-  <!-- 余额 -->
-  <section class="card">
-    <h2>我的内部余额</h2>
-    <div class="row">
-      <div class="bal"><span class="k">PAXI</span><span id="balPaxi" class="v">0</span></div>
-      <div class="bal"><span class="k" id="balTkccLabel">TKCC</span><span id="balTkcc" class="v">0</span></div>
-      <div class="bal"><span class="k">链上 PAXI</span><span id="bankPaxi" class="v">0</span></div>
-    </div>
-    <div class="row wrap">
-      <input id="depAmount" class="inp" type="number" min="0" step="0.000001"
-             placeholder="数量" enterkeyhint="done" />
-      <select id="depToken" class="inp">
-        <option value="paxi">PAXI</option>
-        <option value="tkcc">TKCC</option>
-      </select>
-      <button id="btnDeposit" class="btn">充值</button>
-      <button id="btnWithdraw" class="btn ghost">提现</button>
-    </div>
-    <p class="hint">高频操作走内部余额 + 会话签名，无需逐笔弹钱包。TKCC 未配置时无法充值 TKCC。</p>
-  </section>
+  <main class="pages">
 
-  <!-- 官方模板池（B2） -->
-  <section class="card" id="templateSection">
-    <h2>官方奖池</h2>
-    <p class="hint">点击参与，金额由平台统一设定，满员自动开奖。先到先参与，人人平等（第一个参与的人与后来者待遇完全一致）。</p>
-    <div id="templatePools" class="list"></div>
-  </section>
-
-  <!-- 管理员：模板管理（B2） -->
-  <section class="card" id="adminPanel" hidden>
-    <h2>管理员：运营配置</h2>
-    <p class="hint" id="adminsStatus">管理员：—</p>
-    <p class="hint" id="treasuryStatus">运营金库：—</p>
-    <div class="row wrap">
-      <button id="btnSetTreasury" class="btn">写入运营金库</button>
-    </div>
-
-    <h2>管理员：TKCC 集成</h2>
-    <p class="hint" id="tkccStatus">TKCC 合约：—</p>
-    <div class="row wrap">
-      <button id="btnSetTkcc" class="btn primary">启用 TKCC（写入合约）</button>
-    </div>
-    <div class="grid2">
-      <label>销毁方式（开奖 6%）
-        <select id="burnMode" class="inp">
-          <!-- P2-2：合约 BurnMode::default() = BlackHole，且销毁前会校验黑洞地址。
-               默认项必须与合约一致，否则管理员误选 burn 而 TKCC 不支持时会卡死奖池。 -->
-          <option value="black_hole" selected>BlackHole —— 转到黑洞地址（合约默认，推荐）</option>
-          <option value="burn">Burn —— 调用 TKCC 的 burn（真销毁，需先验证 TKCC 支持）</option>
-          <option value="skip">Skip —— 转入金库（仅测试网）</option>
-        </select>
-      </label>
-      <label>黑洞地址（仅 BlackHole 需要）
-        <input id="burnAddr" class="inp"
-               autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
-               placeholder="paxi1…" />
-      </label>
-    </div>
-    <div class="row wrap">
-      <button id="btnSetBurnMode" class="btn">应用销毁方式</button>
-      <button id="btnSetBurn" class="btn ghost">设置黑洞地址</button>
-    </div>
-    <p class="hint">
-      地址取自 <code>config.js</code>，点一次即写入合约，之后自动生效（无需迁移）。
-      TKCC 与 PAXI 精度都是 <b>6</b>（1 TKCC = 10<sup>6</sup> raw）；本 TKCC 是标准
-      <code>cw20-base</code>，支持 <code>burn</code>，可用真销毁。
-    </p>
-
-    <h2>管理员：模板管理</h2>
-    <p class="hint">simple 版模板只选档位；创建时自动生成随机哈希链（存本机 localStorage），开奖前在下方模板列表点"揭示下一个秘密"。</p>
-    <div class="grid2">
-      <label>模板名<input id="tplName" class="inp" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="入门池" /></label>
-      <label>档位<select id="tplTier" class="inp"></select></label>
-    </div>
-    <button id="btnCreateTpl" class="btn primary block">创建模板</button>
-    <div id="tplList" class="list"></div>
-  </section>
-
-  <!-- 创建抽奖（A 模式：玩家自建池） -->
-  <section class="card">
-    <h2>创建抽奖（玩家自建池）</h2>
-    <p class="hint">simple 版只有三档，费用与人数由档位决定。建池费全额进入奖池，所有加入者按同档参与费支付。</p>
-    <div class="grid2">
-      <label>档位
-        <select id="fTier" class="inp"></select>
-      </label>
-      <p class="hint" id="tierHint">—</p>
-      <p class="hint">到期时间由平台统一配置（默认 24 小时）。</p>
-      <label>随机秘密（可选，仅玩家自建池用）
-        <input id="fSecret" class="inp" type="text"
-               autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
-               placeholder="留空则用兜底随机源" />
-      </label>
-      <p class="hint">「随机秘密」只作用于你自建的池子（commit-reveal）；官方奖池的随机性由平台哈希链提供，与本项无关。</p>
-    </div>
-    <button id="btnCreate" class="btn primary block">创建</button>
-  </section>
-
-  <!-- 列表 -->
-  <section class="card">
-    <h2>抽奖列表</h2>
-    <div class="row wrap">
-      <select id="fStatus" class="inp">
-        <option value="">全部</option>
-        <option value="open">报名中</option>
-        <option value="full">已满员</option>
-        <option value="drawn">已开奖</option>
-        <option value="refunded">已退款</option>
-      </select>
-      <button id="btnRefresh" class="btn">刷新</button>
-    </div>
-    <div id="list" class="list"></div>
-  </section>
-
-  <!-- 揭示秘密弹窗（commit-reveal 抽奖） -->
-  <div id="revealBox" hidden>
-    <div class="card">
-      <h2>揭示秘密（抽奖 #<span id="revealLotteryId"></span>）</h2>
-      <input id="revealSecret" class="inp block" type="text"
-             autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
-             placeholder="建池时填写的随机秘密" />
-      <div class="acts">
-        <button id="btnRevealConfirm" class="btn primary block">确认揭示</button>
-        <button id="btnRevealCancel" class="btn ghost block">取消</button>
+    <!-- ========== 奖池 ========== -->
+    <section class="page" id="page-pools">
+      <div id="claimsTop" class="claims-top" hidden>
+        <div class="claims-title">
+          <span data-i18n="pools.claimsTitle">🎁 待领奖</span><i class="claims-count" id="claimsCount"></i>
+        </div>
+        <div id="claimsTopList" class="list"></div>
       </div>
-      <div class="hint" id="revealHint">建池时的秘密已自动带出；如果是换设备或清过缓存，请手动输入。</div>
-    </div>
-  </div>
+
+      <div id="sessionCard" class="session-card" hidden>
+        <div class="session-card-icon">💡</div>
+        <div class="session-card-body">
+          <div class="session-card-title" id="sessionCardTitle"></div>
+          <div class="session-card-desc" id="sessionCardDesc"></div>
+        </div>
+        <button id="btnSessionCard" class="btn primary sm"></button>
+      </div>
+
+      <div class="rowbar">
+        <select id="fStatus" class="inp">
+          <option value="" data-i18n="pools.filter.ongoing">进行中</option>
+          <option value="all" data-i18n="pools.filter.all">全部（含已结束）</option>
+          <option value="open" data-i18n="pools.filter.open">报名中</option>
+          <option value="full" data-i18n="pools.filter.full">已满员</option>
+          <option value="drawn" data-i18n="pools.filter.drawn">已开奖</option>
+        </select>
+        <button id="btnRefresh" class="btn sm" data-i18n="common.refresh">刷新</button>
+      </div>
+      <div id="list" class="list"></div>
+    </section>
+
+    <!-- ========== 创建 ========== -->
+    <section class="page" id="page-create" hidden>
+      <h2 class="page-title" data-i18n="create.chooseTier">选择档位</h2>
+      <div class="tier-list" id="tierList"></div>
+
+      <div class="cost-box" id="costBox">
+        <div class="cost-row"><span data-i18n="create.costFee">建池费（进奖池）</span><b id="costCreate">—</b></div>
+        <div class="cost-row"><span data-i18n="create.costBal">内部余额</span><b id="costBal">—</b></div>
+      </div>
+
+      <button id="btnCreate" class="btn primary block" data-i18n="create.btn">建池并支付建池费</button>
+      <p class="hint" style="text-align:center;margin-top:14px" data-i18n="create.hint">
+        建池费全额进入奖池，满员自动开奖，任何人都可以触发开奖。
+      </p>
+    </section>
+
+    <!-- ========== 我的 ========== -->
+    <section class="page" id="page-me" hidden>
+      <h2 class="page-title" data-i18n="me.balance">内部余额</h2>
+      <div class="bal-grid">
+        <div class="bal">
+          <div class="k" data-i18n="me.balPaxi">PAXI</div>
+          <div class="v" id="balPaxi">0</div>
+        </div>
+        <div class="bal">
+          <div class="k" id="balTkccLabel" data-i18n="me.balTkcc">TKCC</div>
+          <div class="v" id="balTkcc">0</div>
+        </div>
+        <div class="bal">
+          <div class="k" data-i18n="me.balBank">链上 PAXI</div>
+          <div class="v" id="bankPaxi">0</div>
+        </div>
+      </div>
+
+      <div class="sess-row" id="sessRow">
+        <div class="sess-info">
+          <div class="k" data-i18n="sessStatus.label">无感会话</div>
+          <div class="v off" id="sessStateText"></div>
+          <div class="hint" id="sessGasText"></div>
+        </div>
+        <button id="btnSessionMe" class="btn sm"></button>
+      </div>
+
+      <details class="collapse">
+        <summary data-i18n="me.depositWithdraw">充值 / 提现</summary>
+        <div class="row wrap">
+          <input id="depAmount" class="inp" type="number" min="0" step="0.000001"
+                 data-i18n-placeholder="me.amount" placeholder="数量" enterkeyhint="done" />
+          <select id="depToken" class="inp">
+            <option value="paxi">PAXI</option>
+            <option value="tkcc">TKCC</option>
+          </select>
+          <button id="btnDeposit" class="btn" data-i18n="me.deposit">充值</button>
+          <button id="btnWithdraw" class="btn ghost" data-i18n="me.withdraw">提现</button>
+        </div>
+        <p class="hint" data-i18n="me.depositHint">高频操作走内部余额 + 无感签名；提现会回到链上钱包地址。</p>
+      </details>
+
+      <h2 class="page-title" data-i18n="me.claims">🎁 待领奖</h2>
+      <div id="myClaims" class="list"></div>
+
+      <h2 class="page-title" data-i18n="me.created">🏗️ 我建的池</h2>
+      <div id="myCreated" class="list"></div>
+
+      <h2 class="page-title" data-i18n="me.joined">🎯 我参与的池</h2>
+      <div id="myJoined" class="list"></div>
+    </section>
+
+    <!-- ========== 管理（仅管理员可见） ========== -->
+    <section class="page" id="page-admin" hidden>
+      <h2 class="page-title" data-i18n="admin.opsConfig">运营配置</h2>
+      <p class="hint" id="adminsStatus"></p>
+      <p class="hint" id="treasuryStatus"></p>
+      <button id="btnSetTreasury" class="btn block" data-i18n="msg.treasuryWrite">写入运营金库</button>
+
+      <h2 class="page-title" data-i18n="admin.tkccIntegration">TKCC 集成</h2>
+      <p class="hint" id="tkccStatus"></p>
+      <button id="btnSetTkcc" class="btn primary block" data-i18n="admin.enableTkcc"></button>
+
+      <h2 class="page-title" data-i18n="admin.burnMode">销毁方式（开奖 6%）</h2>
+      <select id="burnMode" class="inp block">
+        <option value="black_hole" selected data-i18n="admin.burnBlackHole">BlackHole —— 转到黑洞地址（推荐）</option>
+        <option value="burn" data-i18n="admin.burnBurn">Burn —— 调用 TKCC 的 burn</option>
+        <option value="skip" data-i18n="admin.burnSkip">Skip —— 转入金库（仅测试网）</option>
+      </select>
+      <input id="burnAddr" class="inp block"
+             data-i18n-placeholder="admin.burnAddrPh"
+             autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off"
+             placeholder="黑洞地址（仅 BlackHole 需要）" />
+      <div class="row wrap">
+        <button id="btnSetBurnMode" class="btn" data-i18n="admin.applyBurnMode">应用销毁方式</button>
+        <button id="btnSetBurn" class="btn ghost" data-i18n="admin.setBurn">设置黑洞地址</button>
+      </div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar">
+    <button class="tab active" data-tab="pools">
+      <span class="ico">🎰</span><span data-i18n="nav.tabPools">奖池</span>
+    </button>
+    <button class="tab" data-tab="create">
+      <span class="ico">✨</span><span data-i18n="nav.tabCreate">创建</span>
+    </button>
+    <button class="tab" data-tab="me">
+      <span class="ico">👤</span><span data-i18n="nav.tabMe">我的</span><i class="dot" id="tabMeDot" hidden></i>
+    </button>
+    <button class="tab" data-tab="admin" id="tabAdmin" hidden>
+      <span class="ico">⚙️</span><span data-i18n="nav.tabAdmin">管理</span>
+    </button>
+  </nav>
 
   <pre id="log" class="log"></pre>
 </div>
 
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').catch(() => {});
+    });
+  }
+</script>
+
 <!-- =====================================================================
-     交易/加密库加载器（本地 vendor 优先 + 多 CDN 兜底）
-     ⚠️ 三个历史教训（勿回退到"直接 import CDN 路径"的写法）：
-     1) jsdelivr 的 /npm/@noble/hashes@x/sha256.js 返回的是 **CJS**（含 require），
-        浏览器 import() 必炸 —— ESM 在 **/esm/** 子目录；
-     2) noble-hashes esm/utils.js 里有裸包导入 '@noble/hashes/crypto'，
-        浏览器解析不了，需要下方 importmap 指到本地文件；
-     3) bech32@2.0.0 整个包只有 CJS（vendor/bech32.mjs 是本地包装的 ESM）。
-     这些库下载于官方 npm 源，node 下全量用例验证通过（见 vendor/ 目录）。
+     交易 / 加密库加载器：本地 vendor 优先 + CDN 兜底
+     ⚠️ 1) jsdelivr 的 /npm/@noble/hashes@x/sha256.js 是 CJS，浏览器
+        import() 必炸 —— ESM 在 /esm/ 子目录；
+        2) noble-hashes esm 有裸包导入 '@noble/hashes/crypto'，需 importmap；
+        3) bech32@2.0.0 只有 CJS，vendor/bech32.mjs 是本地包装的 ESM。
      ===================================================================== -->
-<!-- PaxiCosmJS 是 UMD 且依赖全局 Long，必须先于它加载 long -->
-<script src="./vendor/long.umd.js"></script>
-<script>
-  if (typeof Long === 'undefined') {
-    document.write('<script src="https://cdn.jsdelivr.net/npm/long@5.2.3/umd/index.js"><\/script>');
-  }
-</script>
-<script src="./vendor/paxi-cosmjs.umd.js"></script>
-<script>
-  if (typeof PaxiCosmJS === 'undefined') {
-    document.write('<script src="https://mainnet-api.paxinet.io/resources/js/paxi-cosmjs.umd.js"><\/script>');
-  }
-</script>
-<!-- importmap：解析 noble-hashes ESM 里的裸包导入（远程兜底文件也需要它） -->
 <script type="importmap">
 {
   "imports": {
@@ -197,7 +243,7 @@
     for (const u of urls) {
       try { return await import(u); } catch (e) { errs.push(label + ' ← ' + u + ' : ' + (e && e.message)); }
     }
-    throw new Error(label + '：所有源（本地 + CDN）均加载失败');
+    throw new Error(label + ': all sources failed');
   }
   try {
     window.nobleSecp256k1 = await importAny('secp256k1', [
@@ -222,19 +268,39 @@
     window.nobleHashes = { sha256: s.sha256, ripemd160: r.ripemd160 };
   } catch (e) { errs.push(e.message); }
   try {
-    const m = await importAny('bech32', [
-      './vendor/bech32.mjs',
-      'https://esm.sh/bech32@2.0.0',
-    ]);
-    // 有些构建只给 default 导出，这里做兜底
+    const m = await importAny('bech32', ['./vendor/bech32.mjs', 'https://esm.sh/bech32@2.0.0']);
     window.bech32 = m.bech32 || (m.default && m.default.bech32) || m.default;
   } catch (e) { errs.push(e.message); }
   window.__cryptoErrors = errs;
   window.dispatchEvent(new Event('crypto-ready'));
 </script>
 
+<script>
+  /* cosmjs（2.6MB）异步加载：同步 <script> 会堵住首屏；
+     它是 UMD 且依赖全局 Long —— 必须先确保 Long 就位。 */
+  function loadScript(src) {
+    return new Promise((resolve) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => resolve(true);
+      s.onerror = () => resolve(false);
+      document.head.appendChild(s);
+    });
+  }
+  (async () => {
+    if (typeof Long === 'undefined') await loadScript('./vendor/long.umd.js');
+    if (typeof Long === 'undefined') await loadScript('https://cdn.jsdelivr.net/npm/long@5.2.3/umd/index.js');
+    let ok = await loadScript('./vendor/paxi-cosmjs.umd.js');
+    if (ok && typeof PaxiCosmJS === 'undefined') ok = false;
+    if (!ok) ok = await loadScript('https://mainnet-api.paxinet.io/resources/js/paxi-cosmjs.umd.js');
+    window.__cosmjsReady = !!(ok && typeof PaxiCosmJS !== 'undefined');
+    window.dispatchEvent(new Event('cosmjs-ready'));
+  })();
+</script>
+
 <script src="hash.js"></script>
 <script src="config.js"></script>
+<script src="i18n.js"></script>
 <script src="chain.js"></script>
 <script src="session.js"></script>
 <script src="lottery.js"></script>
