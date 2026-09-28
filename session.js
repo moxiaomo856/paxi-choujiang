@@ -14,6 +14,12 @@
 
   const STORE = window.localStorage;
   const LS = { priv: 'cj_sess_priv', pub: 'cj_sess_pub', addr: 'cj_sess_addr', nonce: 'cj_sess_nonce', user: 'cj_sess_user' };
+  // 已知会话地址列表：本设备为该钱包创建过的全部会话地址。
+  // 用途：开无感前把旧的统统撤销，防止反复开关无感时旧会话留在链上，
+  // 慢慢堆到每钱包上限（MAX_SESSIONS_PER_USER = 5）后注册被拒。
+  // ⚠️ 故意不放进 LS：clear() 只清"当前活跃会话"的私钥/地址等，
+  // 这个清单必须跨「关无感/开无感」保留，否则关一次就丢一个孤儿。
+  const LS_KNOWN = 'cj_sess_addrs';
 
   const state = {
     sessPriv: '',
@@ -71,6 +77,17 @@
     return state.enabled;
   }
 
+  // ---------- 已知会话地址清单（跨开关保留，per 主钱包隔离） ----------
+  function loadKnownAddrs() {
+    try {
+      const a = JSON.parse(STORE.getItem(sk(LS_KNOWN)) || '[]');
+      return Array.isArray(a) ? a.filter((x) => typeof x === 'string' && x) : [];
+    } catch { return []; }
+  }
+  function saveKnownAddrs(arr) {
+    try { STORE.setItem(sk(LS_KNOWN), JSON.stringify(arr)); } catch { /* 禁 localStorage 也别炸 */ }
+  }
+
   function clear() {
     Object.values(LS).forEach((b) => STORE.removeItem(sk(b)));
     _wipeLegacyLocalStorage();
@@ -89,20 +106,24 @@
       throw new Error('加密库未就绪（secp256k1 / hashes / bech32 CDN 未加载）');
     }
 
-    // 注册新会话前先撤销本地遗留的旧会话：
-    // enable() 每次都生成新密钥对，不清旧的话旧 session 会一直占着链上
-    // RegisterSession 的每主钱包会话上限（MAX_SESSIONS_PER_USER）。
-    // 旧会话已过期 / 已被撤销时报错无所谓，clear() 会把本地状态清掉。
-    if (state.sessAddr && state.sessUser === K.wallet.address) {
+    // 注册新会话前，撤销本设备记录过的**全部**旧会话（不止最新 1 个）：
+    // 反复开关无感时，旧会话若不撤销会一直留在链上占名额，堆满 5 个后
+    // RegisterSession 会被 "Too many active sessions" 拒绝。
+    // 逐个独立撤销 + try/catch：旧会话已过期/已撤销/网络抖动都无所谓；
+    // 不能把撤销合进注册那笔多消息交易——Cosmos 交易是原子的，一条
+    // revoke 失败会让整笔回滚，注册也跟着失败。
+    const known = loadKnownAddrs();
+    for (const old of known) {
       try {
         await K.execute(
-          { revoke_session: { session_addr: state.sessAddr } },
+          { revoke_session: { session_addr: old } },
           [],
           { gas: 300000, memo: 'revoke old session' }
         );
       } catch (_) { /* 旧会话已过期/已撤销都无所谓 */ }
-      clear();
     }
+    // 旧的都尝试撤过了，清掉本地"当前活跃会话"状态（旧私钥不再使用）
+    clear();
 
     const { privHex, pubHex } = window.CJHash.genKeyPair();
     const sessAddr = window.CJHash.pubkeyToAddr(pubHex, C.bech32Prefix);
@@ -139,6 +160,8 @@
     state.sessNonce = 0;
     state.enabled = true;
     persist();
+    // 旧的都撤了，清单只留新会话（注册失败抛错时不动清单，下次重试还能补撤）
+    saveKnownAddrs([sessAddr]);
     return sessAddr;
   }
 

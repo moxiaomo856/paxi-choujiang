@@ -17,6 +17,24 @@
   };
   const UNCLAIMED_MAX = 30;   // 已开奖池的"未领奖"查询上限（轮询性能）
 
+  /** 并发受限的 map：LCD 查询并发太高会被限流，8 路并发是稳妥值。
+   *  串行 await 循环查 200 个池要几十秒，并行化后首屏扫描能快一个数量级。 */
+  async function mapLimit(items, limit, fn) {
+    const arr = Array.isArray(items) ? items : [];
+    let i = 0;
+    const n = Math.max(1, Math.min(limit, arr.length));
+    const workers = [];
+    for (let w = 0; w < n; w++) {
+      workers.push((async () => {
+        while (i < arr.length) {
+          const idx = i++;
+          await fn(arr[idx], idx);
+        }
+      })());
+    }
+    await Promise.all(workers);
+  }
+
   const escapeHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -39,8 +57,48 @@
     el.textContent = msg;
   };
 
+  /**
+   * 把合约 / 链上返回的英文错误，映射成用户能看懂的中英文提示。
+   * 合约错误被 cosmwasm 包成 "failed to execute message; message index: 0: <详情>: execute wasm contract failed"，
+   * 所以用子串 / 关键字匹配，而不是靠精确的错误类名。找不到对应项就返回 null（沿用原文）。
+   */
+  function mapContractError(msg) {
+    // 顺序敏感：靠前的优先匹配。每个子串都来自 error.rs 的 #[error(...)] 实际输出。
+    const rules = [
+      [/(already joined)/i,                     'err.alreadyJoined'],
+      [/(not open for joining)/i,                'err.lotteryNotOpen'],
+      [/(creator cannot join)/i,                 'err.creatorCannotJoin'],
+      [/(not a participant)/i,                   'err.notParticipant'],
+      [/(already expired|expired at)/i,          'err.lotteryExpired'],
+      [/(has not expired yet)/i,                 'err.notExpired'],
+      [/(already refunded)/i,                    'err.alreadyRefunded'],
+      [/(already has refunds)/i,                 'err.refundStarted'],
+      [/(already claimed)/i,                     'err.alreadyClaimed'],
+      [/(nothing to claim)/i,                    'err.nothingToClaim'],
+      [/(already drawn)/i,                       'err.alreadyDrawn'],
+      [/(not full yet)/i,                        'err.lotteryNotFull'],
+      [/(not enough participants)/i,             'err.notEnoughParticipants'],
+      [/(is not a winner)/i,                     'err.notWinner'],
+      [/(committed a secret but never revealed)/i, 'err.commitNotRevealed'],
+      [/(no committed secret)/i,                 'err.templateCommit'],
+      [/(insufficient balance|insufficient funds)/i, 'err.insufficientBalance'],
+      [/(too many active sessions)/i,            'err.sessionLimit'],
+      [/(session not found|invalid signature|nonce mismatch)/i, 'err.sessionError'],
+      [/(out of gas|gas insufficient|insufficient fee)/i, 'err.gasError'],
+      [/(contract is paused)/i,                  'err.paused'],
+      [/(unauthorized)/i,                        'err.unauthorized'],
+      [/(must be greater than zero)/i,            'err.zeroAmount'],
+      [/(multisig required)/i,                   'err.multisig'],
+    ];
+    for (const [re, key] of rules) {
+      if (re.test(msg)) return T(key);
+    }
+    return null;
+  }
+
   function fail(e, prefix) {
     const msg = (e && e.message) ? e.message : String(e);
+    const friendly = mapContractError(msg);
     if (e && e.needSession) {
       const b = $('btnSession');
       b.hidden = false;
@@ -49,8 +107,9 @@
       b.textContent = T('wallet.openSession');
       refreshSessionCard();
     }
+    // 日志记原文（方便排查），横幅显示友好提示（找不到则回退原文）
     log((prefix ? prefix + '：' : '') + msg);
-    banner(msg, 'err');
+    banner(friendly || msg, 'err');
   }
 
   // ---------- 手机端防双击 ----------
@@ -149,6 +208,14 @@
   // 奖池视图缓存（id → view）：奖池页与我的页都会写入，
   // 按钮操作从这里取，避免在我的页点到奖池页列表里没有的池（如已退款池）
   let poolCache = new Map();
+  // 终态数据缓存（性能关键）：
+  //   - participantsCache：池子一旦"冻结"（满员/已开奖/已退款/已取消/已截止），
+  //     参与者名单**永远不再变化** → 查一次永久缓存；
+  //   - unclaimedCache：drawn 池的未领名单只在有人领奖时变化 → 缓存，
+  //     领奖成功时按 id 失效（onAction claim 分支）。
+  // 没有这两个缓存，"我的"页每 10 秒轮询会串行打 2×N 个 LCD 查询，池子一多必卡。
+  const participantsCache = new Map();  // id → bool（仅冻结池）
+  const unclaimedCache = new Map();     // id → pending 数组（仅 drawn 池）
 
   // =====================================================================
   // Tab 切换
@@ -265,13 +332,20 @@
       refreshSessionCard();
       return;
     }
-    const a = await S.enable();
-    $('sessTag').hidden = false;
-    $('btnSession').textContent = T('wallet.closeSession');
-    log(T('msg.sessionOpened', { addr: a }));
-    banner(T('msg.sessionOpenedBanner', { h: C.sessionTtlHours || 24, g: (Number(C.sessionGasFund || 300000) / 1e6).toFixed(2) }), 'info');
-    refreshSessionCard();
-    if (currentTab === 'me') refreshSessionStatus().catch(() => {});
+    try {
+      const a = await S.enable();
+      $('sessTag').hidden = false;
+      $('btnSession').textContent = T('wallet.closeSession');
+      log(T('msg.sessionOpened', { addr: a }));
+      banner(T('msg.sessionOpenedBanner', { h: C.sessionTtlHours || 24, g: (Number(C.sessionGasFund || 300000) / 1e6).toFixed(2) }), 'info');
+      refreshSessionCard();
+      if (currentTab === 'me') refreshSessionStatus().catch(() => {});
+    } catch (e) {
+      // 开无感失败（含合约 "Too many active sessions" 等业务拒绝）：
+      // 之前没接 fail()，合约报错直接裸奔；现在走友好映射 + 日志留原文
+      fail(e, T('err.enableSession'));
+      refreshSessionCard();
+    }
   }
 
   // =====================================================================
@@ -353,12 +427,14 @@
       const res = await L.lotteries(status, 100);
       const list = (res.lotteries || []).filter((l) => !l.is_template_pool);
 
-      // 已开奖池要查"谁还没领"：轮询时逐个查会很慢，只查前 N 个
+      // 已开奖池要查"谁还没领"：优先用缓存（领奖成功时失效），轮询零重复查询
       for (const l of list.filter((x) => x.status === 'drawn').slice(0, UNCLAIMED_MAX)) {
+        if (unclaimedCache.has(l.id)) { l._unclaimed = unclaimedCache.get(l.id); continue; }
         try {
           const un = await L.unclaimed(l.id);
           l._unclaimed = (un && un.pending) || [];
         } catch (_) { l._unclaimed = []; }
+        unclaimedCache.set(l.id, l._unclaimed);
       }
 
       let views = list.map((l) => {
@@ -367,12 +443,29 @@
         return v;
       });
       views.forEach((v) => poolCache.set(v.id, v));
+
+      // 维护"我参与过"状态：只对进行中(open 且未过期)且尚未标记过的池查 participants()。
+      // 目的：① "已参与"标签正确；② 参与按钮对已参与的池隐藏（避免重复点触发 AlreadyJoined）。
+      // 已标记过的池跳过查询 → 轮询 / 切 tab 几乎零额外请求。
+      if (K.wallet.address) {
+        for (const v of views) {
+          if ((v.statusView || v.status) !== 'open' || v.expired) continue;
+          if (myJoinedIds.has(v.id)) continue;
+          try {
+            const ps = await L.participants(v.id);
+            if ((ps.participants || []).includes(K.wallet.address)) myJoinedIds.add(v.id);
+          } catch (_) { /* 忽略单池查询失败 */ }
+        }
+      }
+
       views = sortPools(views);
 
-      // 默认"进行中"：过滤掉已退款、以及已开奖且奖金已领完的池
+      // 默认"进行中"/"报名中"：过滤掉已退款、已开奖且奖金已领完、以及已截止只能退款的死池
+      // （死池只出现在"全部"里；创建人 / 参与者也能在"我的"页看到并退款）
       if (mode !== 'all') {
         views = views.filter((v) => {
           if (v.status === 'refunded') return false;
+          if ((v.statusView || v.status) === 'expired') return false;
           if (v.status === 'drawn' && Array.isArray(v._unclaimed) && v._unclaimed.length === 0) return false;
           return true;
         });
@@ -398,13 +491,16 @@
   }
 
   /**
-   * 排序：可参与优先，其次满员待开奖，已结束垫底；
+   * 排序（基于派生状态 statusView）：
+   *   进行中(open) → 满员待开(full) → 已开奖(drawn) → 已截止可退款(expired) → 已退款/取消；
    * 同状态内「快满员的靠前」（进度高的更容易成局），进度相同则快截止的靠前。
+   * 用派生状态让"时间到了没满员"的死池沉到最底，新池 / 进行中池自然回到顶部。
    */
-  const STATUS_RANK = { open: 0, full: 1, drawn: 2, refunded: 3, cancelled: 3 };
+  const STATUS_RANK = { open: 0, full: 1, drawn: 2, expired: 3, refunded: 4, cancelled: 4 };
   function sortPools(views) {
     return views.slice().sort((a, b) => {
-      const r = (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9);
+      const rank = (v) => STATUS_RANK[(v.statusView || v.status) || ''] ?? 9;
+      const r = rank(a) - rank(b);
       if (r) return r;
       const pa = a.maxPeople ? a.count / a.maxPeople : 0;
       const pb = b.maxPeople ? b.count / b.maxPeople : 0;
@@ -463,17 +559,20 @@
     const me = K.wallet.address;
     const isCreator = !!me && v.creator === me;
     const joined = !!me && myJoinedIds.has(v.id);
-    const expired = Date.now() > v.expiresAt;
+    const expired = v.expired;                       // 用统一派生状态，与排序 / 徽章一致
+    const statusView = v.statusView || v.status;
 
-    const stateCls = v.status === 'open' ? 'is-open'
-      : v.status === 'full' ? 'is-full'
-      : v.status === 'drawn' ? 'is-drawn'
-      : v.status === 'refunded' ? 'is-refunded' : '';
+    const stateCls = statusView === 'open' ? 'is-open'
+      : statusView === 'full' ? 'is-full'
+      : statusView === 'drawn' ? 'is-drawn'
+      : statusView === 'expired' ? 'is-expired'
+      : statusView === 'refunded' ? 'is-refunded' : '';
 
     const acts = [];
     if (v.status === 'open' && !expired) {
-      // 建池者不能参与自己的池（合约已拒绝），只给分享
-      if (!isCreator) {
+      // 建池者不能参与自己的池（合约已拒绝）；已参与过的人也不显示「参与」按钮
+      // （避免反复点击触发 AlreadyJoined；myJoinedIds 由 refreshPools / 参与成功后维护）
+      if (!isCreator && !joined) {
         acts.push(`<button class="btn sm primary" data-act="join" data-id="${v.id}">${T('pools.join')}</button>`);
       }
       acts.push(`<button class="btn sm ghost share-btn" data-act="share" data-id="${v.id}">${T('common.share')}</button>`);
@@ -481,7 +580,9 @@
     if (v.status === 'full') {
       acts.push(`<button class="btn sm primary" data-act="draw" data-id="${v.id}">${T('pools.draw')}</button>`);
     }
-    if (expired && v.status !== 'drawn' && v.status !== 'refunded') {
+    // 退款按钮：已截止且未开奖 / 未退款的池，只给"参与过的人 / 建池人"看
+    // （合约层面非参与者点退款会被拒，这里把按钮对齐合约，消除"点了报错"的陷阱）
+    if (expired && v.status !== 'drawn' && v.status !== 'refunded' && (joined || isCreator)) {
       acts.push(`<button class="btn sm ghost" data-act="refund" data-id="${v.id}">${T('pools.refund')}</button>`);
     }
 
@@ -490,7 +591,7 @@
     return `<div class="item ${stateCls}" data-id="${v.id}">
       <div class="item-top">
         <span class="id">${copyable(String(v.id), '抽奖 ID', '#' + v.id)}</span>
-        <span class="st ${v.status}">${v.statusText}</span>
+        <span class="st ${statusView}">${v.statusText}</span>
         ${isCreator ? '<span class="st mine">' + T('pools.tagMine') + '</span>' : ''}
         ${joined ? '<span class="st joined">' + T('pools.tagJoined') + '</span>' : ''}
       </div>
@@ -499,7 +600,7 @@
       <div class="meta">${T('pools.pool')} <b>${v.poolPaxi}</b> PAXI / <b>${v.poolTkcc}</b> TKCC</div>
 
       <div class="bar"><i style="width:${pct}%"></i></div>
-      <div class="meta">${T('pools.people', { c: v.count, m: v.maxPeople })} · ${leftText(v.expiresAt)}${v.randomSource ? ' · ' + v.randomSource : ''}</div>
+      <div class="meta">${T('pools.people', { c: v.count, m: v.maxPeople })} · ${leftText(v.expiresAt)}${v.randomSource ? ' · ' + escapeHtml(v.randomSource) : ''}</div>
 
       ${winHtml}
       ${acts.length ? `<div class="acts">${acts.join('')}</div>` : ''}
@@ -577,22 +678,36 @@
     const claims  = [];
     myJoinedIds = new Set();
 
-    for (const v of pools) {
+    // 8 路并发 + 终态缓存：冻结池的 participants / drawn 池的 unclaimed 只查一次，
+    // 之后每 10 秒的轮询只查活跃池（open 且未过期），LCD 压力降一个数量级。
+    await mapLimit(pools, 8, async (v) => {
       poolCache.set(v.id, v);
       if (v.status === 'drawn') {
-        try {
-          const un = await L.unclaimed(v.id);
-          v._unclaimed = (un && un.pending) || [];
-        } catch (_) { v._unclaimed = []; }
+        if (unclaimedCache.has(v.id)) {
+          v._unclaimed = unclaimedCache.get(v.id);
+        } else {
+          try {
+            const un = await L.unclaimed(v.id);
+            v._unclaimed = (un && un.pending) || [];
+          } catch (_) { v._unclaimed = []; }
+          unclaimedCache.set(v.id, v._unclaimed);
+        }
       }
 
-      if (v.creator === me) { created.push(v); continue; }
+      if (v.creator === me) { created.push(v); return; }
 
       let isJoined = false;
-      try {
-        const ps = await L.participants(v.id);
-        isJoined = (ps.participants || []).includes(me);
-      } catch (_) {}
+      // 冻结判定：非 open（满员/已开奖/已退款/已取消）或已截止 → 名单不再变化，可缓存
+      const frozen = v.status !== 'open' || v.expired;
+      if (frozen && participantsCache.has(v.id)) {
+        isJoined = participantsCache.get(v.id);
+      } else {
+        try {
+          const ps = await L.participants(v.id);
+          isJoined = (ps.participants || []).includes(me);
+        } catch (_) { isJoined = false; }
+        if (frozen) participantsCache.set(v.id, isJoined);
+      }
 
       if (isJoined) {
         myJoinedIds.add(v.id);
@@ -605,7 +720,7 @@
           }
         }
       }
-    }
+    });
 
     $('myClaims').innerHTML  = claims.length
       ? claims.map(renderPoolCard).join('')
@@ -805,6 +920,10 @@
         if (!checkAfford(v)) return;
         const res = await L.joinLottery(id, v.joinTkccRaw, v.joinPaxiRaw);
         log(T('msg.joinOk', { id }) + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
+        // 立即标记"我已参与"并重渲列表，让卡片即时进入"已参与"态、隐藏「参与」按钮
+        // （真正的参与人数与状态由紧随其后的 refreshPools 用链上数据刷新）
+        myJoinedIds.add(id);
+        if (currentTab === 'pools') renderPoolList();
         await S.syncNonce().catch(() => {});
         banner(T('msg.joinOkBanner'), 'info');
       } else if (act === 'draw') {
@@ -815,6 +934,7 @@
         if (btn) { btn.disabled = true; btn.innerHTML = `<span>⏳</span><span>${T('pools.claiming')}</span>`; }
         try {
           await L.claim(id);
+          unclaimedCache.delete(id);   // 领奖成功：该池未领名单已变化，失效缓存让下次刷新取新值
           log(T('msg.claimOk', { id }));
           banner(T('msg.claimOkBanner'), 'info');
         } finally {

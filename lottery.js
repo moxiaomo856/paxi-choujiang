@@ -181,6 +181,7 @@
     drawn: 'status.drawn',
     refunded: 'status.refunded',
     cancelled: 'status.cancelled',
+    expired: 'status.expired',
   };
 
   /** 状态文案：i18n 就绪时翻译，未就绪/未知状态回退原文 */
@@ -229,6 +230,12 @@
 
   function toView(l, tkccDecimals) {
     const tier = C.tiers.find((t) => t.id === Number(l.tier));
+    const expiresAt = Number(l.expires_at) * 1000;
+    const expired = expiresAt < Date.now();
+    // 统一派生"可操作状态"：链上 open 只代表"未开奖"，一个正在收人的池
+    // 与一个时间到了、没满员、只能退款的死池，链上状态都是 open。
+    // 这里把它俩拆开，让排序 / 徽章 / 退款按钮全部由同一份派生状态驱动，不再自相矛盾。
+    const statusView = (l.status === 'open' && expired) ? 'expired' : l.status;
     return {
       id: l.id,
       creator: l.creator,
@@ -243,10 +250,12 @@
       poolPaxi: fmtPaxi(l.settled_pool_paxi && l.settled_pool_paxi !== '0' ? l.settled_pool_paxi : l.pool_paxi),
       poolTkcc: fmtTkcc((l.settled_pool_tkcc && l.settled_pool_tkcc !== '0' ? l.settled_pool_tkcc : l.pool_tkcc), tkccDecimals),
       count: l.participant_count,
-      status: l.status,
-      statusText: statusText(l.status),
-      expiresAt: Number(l.expires_at) * 1000,
-      expiresText: new Date(Number(l.expires_at) * 1000).toLocaleString(
+      status: l.status,            // 链上原始状态（退款判定 / 过滤仍用它）
+      statusView,                  // 派生"可操作状态"（排序 + 徽章用）
+      statusText: statusText(statusView),
+      expired,
+      expiresAt,
+      expiresText: new Date(expiresAt).toLocaleString(
         window.CJ_I18N && window.CJ_I18N.getLang() === 'en' ? 'en-US' : 'zh-CN'
       ),
       winners: l.winners,

@@ -216,6 +216,9 @@ select.inp {
 .item.is-full::before     { background: linear-gradient(180deg, var(--warn), #ffcf6e); }
 .item.is-drawn::before    { background: linear-gradient(180deg, var(--ok), #7ee8a8); }
 .item.is-refunded::before { background: #59617a; }
+.item.is-expired::before   { background: #59617a; }
+.item.is-expired           { opacity: .72; }
+.item.is-expired::before   { background: #59617a; }
 
 .item-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .item-top .id { font-weight: 700; font-size: 15px; }
@@ -227,6 +230,7 @@ select.inp {
 .st.full     { background: rgba(245,166,35,.15);  color: var(--warn); }
 .st.drawn    { background: rgba(46,204,113,.15);  color: var(--ok); }
 .st.refunded { background: rgba(139,148,167,.15); color: var(--muted); }
+.st.expired   { background: rgba(139,148,167,.15); color: var(--muted); }
 .st.mine     { background: rgba(120,140,255,.15); color: #9aa8ff; }
 .st.joined   { background: rgba(46,204,113,.12);  color: #55e08c; }
 .st.first    { background: linear-gradient(135deg, var(--gold), var(--gold-2)); color: #2b1a00; font-weight: 700; }
