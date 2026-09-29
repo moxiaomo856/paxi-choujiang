@@ -57,6 +57,53 @@
     el.textContent = msg;
   };
 
+  /** 地址脱敏：paxi1q…k9x2（中奖名单对外脱敏，自己那条完整显示） */
+  function maskAddr(addr, head = 8, tail = 6) {
+    const s = String(addr || '');
+    if (!s) return '';
+    if (head + tail >= s.length) return s;
+    return `${s.slice(0, head)}…${s.slice(-tail)}`;
+  }
+
+  /**
+   * 中奖名单专用脱敏：固定隐藏中间 12 位，前后各留一半明文。
+   * 例：paxi1qyx…（44 位地址 → 前 16 + 中间 12 隐藏 + 后 16）
+   * 太短的地址退化为通用脱敏。所有人统一处理（含自己），点击仍可复制完整地址。
+   */
+  function maskMiddle12(addr) {
+    const s = String(addr || '');
+    if (!s) return '';
+    const visible = s.length - 12;
+    if (visible < 10) return maskAddr(s, 8, 6);
+    const head = Math.ceil(visible / 2);
+    const tail = visible - head;
+    return `${s.slice(0, head)}…${s.slice(-tail)}`;
+  }
+
+  /**
+   * 轻量 Toast。Banner 负责"持续存在的状态/错误"，Toast 负责"一闪而过的反馈"。
+   * 之前复制、领奖、建池成功都去占 Banner，会把真正的错误提示顶掉。
+   */
+  function toast(msg, kind = 'info', ms = 2800) {
+    if (!msg) return;
+    let wrap = $('toastWrap');
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = 'toastWrap';
+      wrap.className = 'toast-wrap';
+      document.body.appendChild(wrap);
+    }
+    const el = document.createElement('div');
+    el.className = 'toast ' + kind;
+    el.textContent = msg;
+    wrap.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    setTimeout(() => {
+      el.classList.remove('show');
+      setTimeout(() => el.remove(), 220);
+    }, ms);
+  }
+
   /**
    * 把合约 / 链上返回的英文错误，映射成用户能看懂的中英文提示。
    * 合约错误被 cosmwasm 包成 "failed to execute message; message index: 0: <详情>: execute wasm contract failed"，
@@ -170,10 +217,9 @@
         document.execCommand('copy');
         document.body.removeChild(ta);
       }
-      log(T('common.copyOk', { label: label ? ' ' + label : '' }));
-      banner(T('common.copyOk', { label: label ? ' ' + label : '' }), 'info');
+      toast(T('common.copyOk', { label: label ? ' ' + label : '' }), 'info', 1600);
     } catch (e) {
-      banner(T('common.copyFail'), 'warn');
+      toast(T('common.copyFail'), 'warn');
     }
   }
   function copyable(text, label, display) {
@@ -216,6 +262,94 @@
   // 没有这两个缓存，"我的"页每 10 秒轮询会串行打 2×N 个 LCD 查询，池子一多必卡。
   const participantsCache = new Map();  // id → bool（仅冻结池）
   const unclaimedCache = new Map();     // id → pending 数组（仅 drawn 池）
+
+  // =====================================================================
+  // 本地统计 / 成就（纯 localStorage，不涉及链上，不影响合约）
+  // =====================================================================
+  const STATS_KEY = 'cj_stats_v1';
+  const ACH_KEY   = 'cj_achievements_v1';
+  const WINS_KEY  = 'cj_counted_wins_v1';   // 已计入"中奖"统计的池 id，防重复累加
+
+  function loadJSON(key) { try { return JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch (_) { return {}; } }
+  function saveJSON(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (_) {} }
+
+  const ACH_LIST = [
+    { id: 'firstConnect', key: 'connect', need: 1,  icon: '🔌' },
+    { id: 'firstJoin',    key: 'join',    need: 1,  icon: '🎯' },
+    { id: 'firstCreate',  key: 'create',  need: 1,  icon: '🏗️' },
+    { id: 'firstWin',     key: 'win',     need: 1,  icon: '🏆' },
+    { id: 'firstClaim',   key: 'claim',   need: 1,  icon: '💰' },
+    { id: 'tenJoins',     key: 'join',    need: 10, icon: '🎖️' },
+    { id: 'threeWins',    key: 'win',     need: 3,  icon: '👑' },
+    { id: 'fiveCreates',  key: 'create',  need: 5,  icon: '🧱' },
+  ];
+
+  function bumpStat(key, n = 1) {
+    const s = loadJSON(STATS_KEY);
+    s[key] = (Number(s[key]) || 0) + n;
+    saveJSON(STATS_KEY, s);
+    checkAchievements(s);
+  }
+
+  function checkAchievements(stats) {
+    const got = loadJSON(ACH_KEY);
+    const fresh = [];
+    for (const it of ACH_LIST) {
+      if (got[it.id]) continue;
+      if ((Number(stats[it.key]) || 0) >= it.need) {
+        got[it.id] = Date.now();
+        fresh.push(it);
+      }
+    }
+    if (!fresh.length) return;
+    saveJSON(ACH_KEY, got);
+    // 错开一点再弹，避免和"操作成功"的 Toast 撞车
+    fresh.forEach((it, i) => {
+      setTimeout(() => toast(`${it.icon} ${T('ach.' + it.id)}`, 'info', 4000), 300 + i * 500);
+    });
+  }
+
+  /** 中奖只计一次：用「poolId:名次」集合去重，否则每次轮询都会 +1 */
+  function countWinOnce(v, me) {
+    if (!v.winners || v.status !== 'drawn' || !me) return false;
+    const isFirst  = (v.winners.first  || []).includes(me);
+    const isSecond = (v.winners.second || []).includes(me);
+    if (!isFirst && !isSecond) return false;
+    const counted = loadJSON(WINS_KEY);
+    const k = `${v.id}:${isFirst ? '1' : '2'}`;
+    if (counted[k]) return false;
+    counted[k] = Date.now();
+    saveJSON(WINS_KEY, counted);
+    bumpStat('win');
+    return true;
+  }
+
+  /** 扫一批池，把自己中奖的池计入统计（countWinOnce 内部去重，重复/轮询调用都安全） */
+  function scanWins(list) {
+    const me = K.wallet.address;
+    if (!me || !Array.isArray(list)) return;
+    for (const v of list) countWinOnce(v, me);
+  }
+
+  function renderStats() {
+    const box = $('statsBox');
+    if (!box) return;
+    const s = loadJSON(STATS_KEY);
+    const ach = loadJSON(ACH_KEY);
+    const badges = ACH_LIST.map((it) =>
+      `<span class="ach ${ach[it.id] ? 'got' : ''}" title="${escapeHtml(T('ach.' + it.id))}">${it.icon}</span>`
+    ).join('');
+    box.innerHTML = `
+      <div class="stats-grid">
+        <div class="stat"><div class="k">${T('me.statJoined')}</div><div class="v">${s.join || 0}</div></div>
+        <div class="stat"><div class="k">${T('me.statCreated')}</div><div class="v">${s.create || 0}</div></div>
+        <div class="stat"><div class="k">${T('me.statWon')}</div><div class="v">${s.win || 0}</div></div>
+        <div class="stat"><div class="k">${T('me.statClaim')}</div><div class="v">${s.claim || 0}</div></div>
+      </div>
+      <div class="ach-row">
+        <span class="ach-label">${T('me.achievements')}</span>${badges}
+      </div>`;
+  }
 
   // =====================================================================
   // Tab 切换
@@ -269,6 +403,7 @@
   // =====================================================================
   async function onConnect() {
     const addr = await K.connect();
+    bumpStat('connect');
     $('addr').innerHTML = copyable(addr, '地址', addr.slice(0, 10) + '…' + addr.slice(-6));
     $('btnSession').hidden = false;
     // 清掉连接前遗留的错误横幅（注入完成前点过连接会留下误导性报错）
@@ -481,6 +616,7 @@
         const won = (v.winners.first || []).includes(me) || (v.winners.second || []).includes(me);
         return won && (v._unclaimed || []).includes(me);
       });
+      scanWins(allPools);       // 中奖统计（内部去重，轮询不会重复累加）
       renderClaimsTop();
       renderPoolList();
 
@@ -541,17 +677,87 @@
     bindCardActions(el);
   }
 
-  /** 剩余时间：剩余 X 小时 Y 分 / 已截止 */
-  function leftText(expiresAt) {
-    const ms = expiresAt - Date.now();
-    if (ms <= 0) return '<span class="left">' + T('pools.expired') + '</span>';
+  /** raw 字符串 → Number（按精度），避免 fmtWan 的"万"被 parseFloat 吞成 NaN */
+  function rawToNum(raw, decimals) {
+    try { return Number(BigInt(String(raw || '0'))) / (10 ** Number(decimals || 0)); }
+    catch (_) { return 0; }
+  }
+
+  /** 倒计时分段：文本 + 是否临近截止（≤1h 标红）+ 是否已截止 */
+  function countdownParts(expiresAt) {
+    const ms = Number(expiresAt) - Date.now();
+    if (ms <= 0) return { text: T('pools.expired'), soon: false, done: true };
     const m = Math.floor(ms / 60000);
     const d = Math.floor(m / 1440);
     const h = Math.floor((m % 1440) / 60);
     const mm = m % 60;
-    if (d > 0) return `<span class="left">${T('pools.leftDays', { d, h })}</span>`;
-    if (h > 0) return `<span class="left">${T('pools.leftHours', { h, m: mm })}</span>`;
-    return `<span class="left">${T('pools.leftMinutes', { m: mm })}</span>`;
+    return {
+      text: d > 0 ? T('pools.leftDays', { d, h })
+        : h > 0 ? T('pools.leftHours', { h, m: mm })
+        : T('pools.leftMinutes', { m: mm }),
+      soon: ms < 3600000,
+      done: false,
+    };
+  }
+
+  /** 剩余时间（带 data-expires，供每秒 tick 就地刷新，不必重渲整张卡） */
+  function leftText(expiresAt) {
+    const p = countdownParts(expiresAt);
+    return `<span class="left${p.soon ? ' soon' : ''}" data-expires="${Number(expiresAt)}">${p.text}</span>`;
+  }
+
+  /** 热度标签 */
+  function hotTags(v) {
+    const tags = [];
+    const st = v.statusView || v.status;
+    if (st === 'open' && v.maxPeople && v.count / v.maxPeople >= 0.8) {
+      tags.push(`<span class="hot-tag hot">${T('pools.hot')}</span>`);
+    }
+    const left = v.expiresAt - Date.now();
+    if (st === 'open' && left > 0 && left < 3600000) {
+      tags.push(`<span class="hot-tag closing">${T('pools.closingSoon')}</span>`);
+    }
+    if (st === 'drawn' && Date.now() - (v.expiresAt || 0) < 600000) {
+      tags.push(`<span class="hot-tag just">${T('pools.justDrawn')}</span>`);
+    }
+    return tags.join('');
+  }
+
+  /** 预计一等奖：按合约 bps 常量（PAXI 40% / TKCC 38%）算，口径与开奖一致 */
+  function expectedHtml(v) {
+    const st = v.statusView || v.status;
+    if (st !== 'open' && st !== 'full') return '';
+    if (!v.count) return '';
+    const paxi = rawToNum(v.poolPaxiRaw, C.coinDecimals) * 0.4;
+    const tkcc = rawToNum(v.poolTkccRaw, tkccInfo.decimals) * 0.38;
+    if (!paxi && !tkcc) return '';
+    return `<div class="meta expected">🎯 ${T('pools.expectedFirst', {
+      p: paxi.toFixed(2),
+      t: L.fmtWan(Math.trunc(tkcc)),
+    })}</div>`;
+  }
+
+  /** 中奖名单单行：统一隐藏中间 12 位（含自己），点击可复制完整地址 */
+  function renderWinnerRow(addr, me, medal, cls) {
+    const isMe = !!me && addr === me;
+    const shown = maskMiddle12(addr);
+    return `<div class="winner ${cls}${isMe ? ' me' : ''}">
+      <span class="medal">${medal}</span>
+      ${isMe ? `<span class="me-tag">${T('common.you')}</span>` : ''}
+      ${copyable(addr, T('common.address'), shown)}
+    </div>`;
+  }
+
+  function renderWinners(v, me) {
+    if (v.status !== 'drawn' || !v.winners) return '';
+    const first  = v.winners.first  || [];
+    const second = v.winners.second || [];
+    if (!first.length && !second.length) return '';
+    return `<div class="winners-box">
+      <div class="winners-title">${T('pools.winnersTitle')}</div>
+      ${first.map((a)  => renderWinnerRow(a, me, '🥇', 'first')).join('')}
+      ${second.map((a) => renderWinnerRow(a, me, '🥈', 'second')).join('')}
+    </div>`;
   }
 
   function renderPoolCard(v) {
@@ -586,7 +792,10 @@
       acts.push(`<button class="btn sm ghost" data-act="refund" data-id="${v.id}">${T('pools.refund')}</button>`);
     }
 
-    const winHtml = renderWinBanner(v, me);
+    // 详情按钮：任何状态都能点进去看（未开奖看参与者，已开奖看中奖名单 + 分配明细）
+    acts.push(`<button class="btn sm ghost" data-act="detail" data-id="${v.id}">${T('pools.viewDetail')}</button>`);
+
+    const winHtml = renderWinBanner(v, me) + renderWinners(v, me);
 
     return `<div class="item ${stateCls}" data-id="${v.id}">
       <div class="item-top">
@@ -594,6 +803,7 @@
         <span class="st ${statusView}">${v.statusText}</span>
         ${isCreator ? '<span class="st mine">' + T('pools.tagMine') + '</span>' : ''}
         ${joined ? '<span class="st joined">' + T('pools.tagJoined') + '</span>' : ''}
+        ${hotTags(v)}
       </div>
 
       <div class="meta">${T('pools.fee')} <b>${v.joinPaxi}</b> PAXI + <b>${v.joinTkcc}</b> TKCC</div>
@@ -601,7 +811,7 @@
 
       <div class="bar"><i style="width:${pct}%"></i></div>
       <div class="meta">${T('pools.people', { c: v.count, m: v.maxPeople })} · ${leftText(v.expiresAt)}${v.randomSource ? ' · ' + escapeHtml(v.randomSource) : ''}</div>
-
+      ${expectedHtml(v)}
       ${winHtml}
       ${acts.length ? `<div class="acts">${acts.join('')}</div>` : ''}
     </div>`;
@@ -616,8 +826,14 @@
     const isSecond = (w.second || []).includes(me);
     if (!isFirst && !isSecond) return '';
 
+    // _unclaimed 还没查回来时不能当成"待领奖"，否则会闪出一个点了就报错的领奖按钮
     const pending = v._unclaimed;
-    const claimed = Array.isArray(pending) && !pending.includes(me);
+    if (!Array.isArray(pending)) {
+      return `<div class="win-banner ${isFirst ? 'first' : 'second'}">
+        <span class="ico">⏳</span><span>${T('common.loading')}</span>
+      </div>`;
+    }
+    const claimed = !pending.includes(me);
 
     if (isFirst) {
       if (claimed) {
@@ -655,6 +871,114 @@
   }
 
   // =====================================================================
+  // 弹窗：开奖结果 / 奖池详情
+  // =====================================================================
+  async function fetchView(id) {
+    let v = poolCache.get(id);
+    if (v && v._unclaimed) return v;
+    try {
+      const l = await L.lottery(id);
+      v = L.toView(l, tkccInfo.decimals);
+      try { v._unclaimed = ((await L.unclaimed(id)) || {}).pending || []; } catch (_) { v._unclaimed = []; }
+      poolCache.set(v.id, v);
+      return v;
+    } catch (_) {
+      return poolCache.get(id) || null;
+    }
+  }
+
+  /** 开奖结果弹窗：中奖名单 + 分配明细 + 随机源/seed（可对外证明"没作弊"） */
+  async function showDrawResult(id) {
+    const v = await fetchView(id);
+    if (!v) return toast(T('msg.poolNotFound'), 'err');
+    const me = K.wallet.address;
+    const first  = (v.winners && v.winners.first)  || [];
+    const second = (v.winners && v.winners.second) || [];
+    const isMine = !!me && (first.includes(me) || second.includes(me));
+
+    document.body.insertAdjacentHTML('beforeend', `
+      <div class="modal-mask" onclick="if(event.target===this)this.remove()">
+        <div class="modal">
+          <h3 class="modal-title">🎉 ${T('pools.drawResult')} #${v.id}</h3>
+          ${isMine ? `<div class="mine-banner">${T('pools.youWon')}</div>` : ''}
+          ${renderWinners(v, me) || `<div class="empty">${T('pools.noWinners')}</div>`}
+          <details class="draw-detail">
+            <summary>${T('pools.distribution')}</summary>
+            <div class="meta">🥇 1 ${T('pools.person')} · TKCC 38% / PAXI 40%</div>
+            <div class="meta">🥈 2 ${T('pools.person')} · TKCC 28% / PAXI 30%</div>
+            <div class="meta">🏗️ ${T('pools.creatorShare')} · TKCC 14% / PAXI 15%</div>
+            <div class="meta">🏢 ${T('pools.opShare')} · TKCC 14% / PAXI 15%</div>
+            <div class="meta">🔥 ${T('pools.burnShare')} · TKCC 6%</div>
+            ${v.randomSource ? `<div class="meta">🎲 ${T('pools.randomSource')}: <b>${escapeHtml(v.randomSource)}</b></div>` : ''}
+            ${v.seed ? `<div class="meta">🌱 ${T('pools.seed')}: ${copyable(v.seed, 'seed', maskAddr(v.seed, 12, 8))}</div>` : ''}
+          </details>
+          <button class="btn primary block" data-modal-close>${T('common.close')}</button>
+        </div>
+      </div>`);
+    bindModalClose();
+
+    if (isMine && window.confetti) {
+      try { confetti({ particleCount: 180, spread: 90, origin: { y: 0.6 } }); } catch (_) {}
+    }
+  }
+
+  /** 奖池详情弹窗：基本信息 + 参与者名单（自己高亮） */
+  async function showPoolDetail(id) {
+    const v = await fetchView(id);
+    if (!v) return toast(T('msg.poolNotFound'), 'err');
+    const me = K.wallet.address;
+    let participants = [];
+    try { participants = (await L.participants(v.id)).participants || []; } catch (_) {}
+
+    document.body.insertAdjacentHTML('beforeend', `
+      <div class="modal-mask" onclick="if(event.target===this)this.remove()">
+        <div class="modal">
+          <h3 class="modal-title">${T('pools.detailTitle')} #${v.id}</h3>
+          <div class="meta">${T('pools.fee')} <b>${v.joinPaxi}</b> PAXI + <b>${v.joinTkcc}</b> TKCC</div>
+          <div class="meta">${T('pools.pool')} <b>${v.poolPaxi}</b> PAXI / <b>${v.poolTkcc}</b> TKCC</div>
+          <div class="meta">${T('pools.people', { c: v.count, m: v.maxPeople })} · ${leftText(v.expiresAt)}</div>
+          ${renderWinners(v, me)}
+          ${v.status === 'drawn' ? `<details class="draw-detail"><summary>${T('pools.distribution')}</summary>
+            <div class="meta">🥇 1 ${T('pools.person')} · TKCC 38% / PAXI 40%</div>
+            <div class="meta">🥈 2 ${T('pools.person')} · TKCC 28% / PAXI 30%</div>
+            <div class="meta">🏗️ ${T('pools.creatorShare')} · TKCC 14% / PAXI 15%</div>
+            <div class="meta">🏢 ${T('pools.opShare')} · TKCC 14% / PAXI 15%</div>
+            <div class="meta">🔥 ${T('pools.burnShare')} · TKCC 6%</div>
+          </details>` : ''}
+          <details class="draw-detail"${v.status === 'drawn' ? '' : ' open'}>
+            <summary>${T('pools.participants')} (${participants.length})</summary>
+            <div class="participants">
+              ${participants.map((a) => {
+                const isMe = !!me && a === me;
+                return `<div class="winner${isMe ? ' me' : ''}">
+                  <span class="medal">·</span>
+                  ${isMe ? `<span class="me-tag">${T('common.you')}</span>` : ''}
+                  ${copyable(a, T('common.address'), maskMiddle12(a))}
+                </div>`;
+              }).join('') || '<div class="empty">—</div>'}
+            </div>
+          </details>
+          <button class="btn primary block" data-modal-close>${T('common.close')}</button>
+        </div>
+      </div>`);
+    bindModalClose();
+  }
+
+  /** 关闭按钮走 JS 绑定，避免内联 onclick 依赖全局（CSP 更友好） */
+  function bindModalClose() {
+    document.querySelectorAll('[data-modal-close]:not([data-bound])').forEach((b) => {
+      b.setAttribute('data-bound', '1');
+      b.onclick = () => { const m = b.closest('.modal-mask'); if (m) m.remove(); };
+    });
+  }
+  // ESC 关弹窗
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const m = document.querySelector('.modal-mask');
+    if (m) m.remove();
+  });
+
+  // =====================================================================
   // 我的页
   // =====================================================================
   async function refreshMyPage() {
@@ -662,6 +986,7 @@
       $('myClaims').innerHTML  = '<div class="empty">' + T('me.needConnect') + '</div>';
       $('myCreated').innerHTML = '';
       $('myJoined').innerHTML  = '';
+      renderStats();      // 未连接也展示本地历史统计/成就
       return;
     }
     await refreshBalance();
@@ -740,6 +1065,8 @@
 
     // 待领奖以"我的"页结果为准（这里扫的是全部池，更全），同步给顶部区块与红点
     pendingClaims = claims;
+    scanWins(pools);          // 这里扫的是全部池，比奖池页更全
+    renderStats();
     renderClaimsTop();
     // 奖池列表里同步"已参与"标记
     if (currentTab === 'pools') renderPoolList();
@@ -920,34 +1247,49 @@
         if (!checkAfford(v)) return;
         const res = await L.joinLottery(id, v.joinTkccRaw, v.joinPaxiRaw);
         log(T('msg.joinOk', { id }) + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
-        // 立即标记"我已参与"并重渲列表，让卡片即时进入"已参与"态、隐藏「参与」按钮
-        // （真正的参与人数与状态由紧随其后的 refreshPools 用链上数据刷新）
+        // 乐观更新：不等链上刷新，先把人数 +1、进度条顶上去、按钮变「已参与」
         myJoinedIds.add(id);
+        bumpStat('join');
+        if (v) {
+          v.count = (v.count || 0) + 1;
+          const card = document.querySelector(`.item[data-id="${id}"]`);
+          if (card) {
+            const bar = card.querySelector('.bar i');
+            if (bar) bar.style.width = Math.min(100, Math.round((v.count / v.maxPeople) * 100)) + '%';
+            card.querySelector('button[data-act="join"]')?.remove();
+          }
+        }
         if (currentTab === 'pools') renderPoolList();
         await S.syncNonce().catch(() => {});
-        banner(T('msg.joinOkBanner'), 'info');
+        toast(T('msg.joinOkBanner'), 'info');
       } else if (act === 'draw') {
         await L.drawLottery(id);
         log(T('msg.drawOk', { id }));
-        banner(T('msg.drawOkBanner'), 'info');
+        toast(T('msg.drawOkBanner'), 'info');
+        unclaimedCache.delete(id);
+        showDrawResult(id).catch(() => {});   // 弹结果 + 中奖名单 + 分配明细
       } else if (act === 'claim') {
         if (btn) { btn.disabled = true; btn.innerHTML = `<span>⏳</span><span>${T('pools.claiming')}</span>`; }
         try {
           await L.claim(id);
           unclaimedCache.delete(id);   // 领奖成功：该池未领名单已变化，失效缓存让下次刷新取新值
+          bumpStat('claim');
           log(T('msg.claimOk', { id }));
-          banner(T('msg.claimOkBanner'), 'info');
+          toast(T('msg.claimOkBanner'), 'info');
         } finally {
           if (btn) btn.disabled = false;
         }
       } else if (act === 'refund') {
         await L.refund(id);
         log(T('msg.refundLog', { id }));
-        banner(T('msg.refundOk'), 'info');
+        toast(T('msg.refundOk'), 'info');
       } else if (act === 'share') {
         const v = poolCache.get(id) || allPools.find((x) => x.id === id);
         await sharePool(v);
         return;   // 分享不刷新列表
+      } else if (act === 'detail') {
+        await showPoolDetail(id);
+        return;   // 只是看，不刷新列表
       }
 
       if (currentTab === 'pools') await refreshPools().catch(() => {});
@@ -1005,7 +1347,8 @@
     try {
       const res = await L.createLottery({ tier: selectedTier });
       log(T('msg.createOk') + (res.transactionHash ? ' tx=' + res.transactionHash : ''));
-      banner(T('msg.createOkBanner'), 'info');
+      bumpStat('create');
+      toast(T('msg.createOkBanner'), 'info');
       await S.syncNonce().catch(() => {});
       switchTab('me');
     } catch (e) {
@@ -1129,10 +1472,20 @@
     refreshTkcc(true).catch(() => {});
     updateCostBox();
     renderTierList();
+    renderStats();
     if (currentTab === 'pools')      refreshPools().catch(() => {});
     else if (currentTab === 'me')    refreshMyPage().catch(() => {});
     else if (currentTab === 'admin') refreshAdminPage().catch(() => {});
   });
+
+  // 倒计时每秒就地刷新（只改文字，不重渲列表；跨过 1 小时自动变红）
+  setInterval(() => {
+    document.querySelectorAll('.left[data-expires]').forEach((el) => {
+      const p = countdownParts(Number(el.dataset.expires));
+      el.textContent = p.text;
+      el.classList.toggle('soon', p.soon);
+    });
+  }, 1000);
 
   // =====================================================================
   // 初始化
@@ -1144,6 +1497,7 @@
   updateCostBox();
   switchTab('pools');
   refreshTkcc(true).catch(() => {});
+  renderStats();
 
   const isWechat = /MicroMessenger/i.test(navigator.userAgent);
   if (isWechat) {

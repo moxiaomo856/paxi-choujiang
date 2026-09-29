@@ -61,8 +61,9 @@
 
   // ---------- 查询 ----------
   const lottery = (id) => K.queryContract({ lottery: { id: Number(id) } });
-  const lotteries = (status, limit = 30) =>
-    K.queryContract({ lotteries: { status: status || null, start_after: null, limit } });
+  // start_after：合约支持游标分页，翻下一页时传上一页最后一个 id
+  const lotteries = (status, limit = 30, startAfter = null) =>
+    K.queryContract({ lotteries: { status: status || null, start_after: startAfter, limit } });
   const participants = (id) => K.queryContract({ participants: { id: Number(id) } });
   const winners = (id) => K.queryContract({ winners: { id: Number(id) } });
   const payout = (id) => K.queryContract({ payout: { id: Number(id) } });
@@ -231,6 +232,9 @@
   function toView(l, tkccDecimals) {
     const tier = C.tiers.find((t) => t.id === Number(l.tier));
     const expiresAt = Number(l.expires_at) * 1000;
+    // 开奖后 pool_* 归零，历史奖池在 settled_pool_*
+    const poolPaxiRaw = (l.settled_pool_paxi && l.settled_pool_paxi !== '0') ? l.settled_pool_paxi : l.pool_paxi;
+    const poolTkccRaw = (l.settled_pool_tkcc && l.settled_pool_tkcc !== '0') ? l.settled_pool_tkcc : l.pool_tkcc;
     const expired = expiresAt < Date.now();
     // 统一派生"可操作状态"：链上 open 只代表"未开奖"，一个正在收人的池
     // 与一个时间到了、没满员、只能退款的死池，链上状态都是 open。
@@ -247,8 +251,12 @@
       joinTkccRaw: l.join_tkcc,
       maxPeople: l.max_people,
       // 开奖后 pool_* 归零，历史奖池在 settled_pool_*
-      poolPaxi: fmtPaxi(l.settled_pool_paxi && l.settled_pool_paxi !== '0' ? l.settled_pool_paxi : l.pool_paxi),
-      poolTkcc: fmtTkcc((l.settled_pool_tkcc && l.settled_pool_tkcc !== '0' ? l.settled_pool_tkcc : l.pool_tkcc), tkccDecimals),
+      poolPaxi: fmtPaxi(poolPaxiRaw),
+      poolTkcc: fmtTkcc(poolTkccRaw, tkccDecimals),
+      // raw 值：UI 里算"预计一等奖"必须用它，
+      // 用格式化字符串反解会把 fmtWan 的「万」算成 NaN
+      poolPaxiRaw,
+      poolTkccRaw,
       count: l.participant_count,
       status: l.status,            // 链上原始状态（退款判定 / 过滤仍用它）
       statusView,                  // 派生"可操作状态"（排序 + 徽章用）
